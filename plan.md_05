@@ -1,0 +1,476 @@
+# Section 5 — implementation plan
+
+## Purpose and scope
+
+This document is the implementation plan required by Section 5 of `HW1-1.pdf`.
+It is deliberately written before RTL.  It defines, for every submodule:
+
+1. the state, registers, memories, and constants;
+2. the planned `always_ff` and `always_comb` blocks and the behavior of each;
+3. the FSM states and legal transitions where a module is stateful;
+4. clock, reset, latency, handshake, and boundary behavior;
+5. verification checkpoints that must pass before integration.
+
+`code.v_05` is not produced in this step.  When RTL is written, every relevant
+line will carry a `// Step N:` comment that maps it to the numbered steps below,
+so that the code can be reviewed against this plan line by line.
+
+## Section 6 interface revision
+
+The Section 6 audit found that the original controller header did not expose
+all status signals required by the memory and ready/valid contracts. The
+official interface is now amended in `controller_fsm.md` and propagated to
+`partitioning.md_02`, `spec.md_03`, and `06_1_planner.md` with these inputs:
+`bias_valid`, `layer2_group_valid`, `buffer_full`,
+`buffer_consume_valid`, and `buffer_consume_ready`. The controller advances a
+group only on the accepted condition
+`buffer_consume_valid && buffer_consume_ready && buffer_consume_last`.
+The Section 6 planner is the active implementation handoff; this Section 5
+document remains the historical candidate plan and must not override that
+amended interface.
+
+## Global implementation rules
+
+- Use synthesizable SystemVerilog-2012 only.  Do not use `initial` blocks,
+  delays, `real`, floating-point SystemVerilog types, or vendor-specific RAM and
+  arithmetic primitives.
+- Every sequential block is clocked by `posedge clk` and uses the synchronous,
+  active-high `rst` convention.  Reset is the first branch in the block and
+  has priority over requests, handshakes, and state transitions.
+- Use nonblocking assignments for flops, counters, state, memories, and output
+  registers.  Use blocking assignments for temporaries and next-value logic in
+  combinational blocks.  No register is assigned from both an `always_ff` and an
+  `always_comb` block.
+- A stateful module has one clearly identified sequential state/register block.
+  A separate combinational block is used for next-state, selector, and control
+  logic when that makes the timing relationship explicit.  Purely combinational
+  modules have no clock or reset logic.
+- All stored and transferred numeric values are 16-bit IEEE-754 binary16 bit
+  patterns.  Arithmetic is exact FP16 arithmetic with FP16 rounding after each
+  multiply or add; there is no hidden FP32 accumulation and no fused multiply-add.
+- Validity is explicit.  A data bus is not consumed unless its corresponding
+  valid/ready handshake succeeds.  Invalid output cycles drive data to zero
+  where the module contract specifies this, so stale data cannot be mistaken for
+  a result.
+- Address and counter bounds are explicit in the RTL.  The controller is the
+  only module that sequences the complete network; submodules do not invent
+  transactions or silently wrap counters.
+- Parameter memories are declared in the RTL but are loaded by the testbench or
+  synthesis wrapper from the supplied `.mem` files.  The design itself does not
+  use an `initial` block for functional memory initialization.
+- The FC2 weight layout remains physically flattened in `weight_sram`.  The
+  controller performs the non-arithmetic regrouping described below; the SRAM
+  must not assume that one physical row is one logical digit group.
+
+## 1. `controller_fsm`
+
+### Implementation objective
+
+Sequence one complete transaction from `start` through FC1, ReLU/hidden storage,
+FC2, and argmax.  Generate every memory request and datapath start pulse, hold
+  all indices stable while waiting for a response, perform the FC2 physical-row
+  regrouping, and emit a one-cycle `done` pulse after `argmax_done`.
+
+### Registers and parameters
+
+- Enumerated state register and next-state value.
+- `neuron_index` for FC1 (3 bits), `digit_index` for FC2 (4 bits), and
+  `group_index` (7 bits; two FC1 groups or two FC2 groups).
+- Registered bias-valid/operand-wait flags where a response must be consumed
+  exactly once.
+- FC2 staging registers for the seven logical selected weights and their
+  `selected_weight_valid` mask.
+- Physical FC2 gather bookkeeping: `flat_index`, physical `row_addr`, lane
+  position, and a small set of pending lane registers.  These are control/data
+  staging registers only; they do not perform arithmetic.
+- One-cycle pulse registers or registered outputs for `busy`, `done`, requests,
+  starts, writes, and argmax transfer signals.  Defaults are deasserted each
+  cycle in combinational control logic.
+
+### Planned blocks
+
+1. **One `always_ff` block — state, counters, and staging.**  On reset, enter
+   `IDLE`, clear all counters, staging registers, and pulse-holding registers.
+   Otherwise, commit `next_state`, update the counter associated with the
+   accepted response, and capture physical weight rows only in the gather
+   states.
+2. **One `always_comb` block — next-state and output controls.**  Start with
+   safe defaults (`*_req`, `*_start`, writes, `done`, and valid pulses low),
+   then decode the current state and status inputs.  Use blocking assignments
+   for temporary addresses and next values.  All output pulses are asserted
+   only in the state that owns their acceptance edge.
+
+### FSM states and transitions
+
+The following states are the required control points; a transition occurs only
+when the stated response or ready condition is true.
+
+| State | Responsibility | Transition |
+|---|---|---|
+| `IDLE` | Wait for `start`; keep `busy=0`. | Accepted `start` → `FC1_BIAS_REQ`. |
+| `FC1_BIAS_REQ` | Request bias `neuron_index`. | Request edge → `FC1_BIAS_WAIT`. |
+| `FC1_BIAS_WAIT` | Wait for one-cycle bias response. | `bias_valid` → `FC1_INPUT_REQ`. |
+| `FC1_INPUT_REQ` | Request input group `group_index` and physical FC1 weight row `neuron*112+group`. | Requests issued → `FC1_OPERAND_WAIT`. |
+| `FC1_OPERAND_WAIT` | Wait for both one-cycle input response and seven-cycle weight response. | Both valid → `FC1_MAC_START`. |
+| `FC1_MAC_START` | Assert multiplier start with the captured operands and row mask. | Start accepted → `FC1_GROUP_WAIT`. |
+| `FC1_GROUP_WAIT` | Wait for multiplier/buffer/accumulator completion of this group. | Group complete → next `FC1` group or `FC1_RESULT_WAIT`. |
+| `FC1_RESULT_WAIT` | Wait for the final accumulator result. | Result valid → `FC1_RELU_STORE`. |
+| `FC1_RELU_STORE` | Apply ReLU and write one hidden register. | Write edge → next neuron or `FC2_BIAS_REQ`. |
+| `FC2_BIAS_REQ` | Request bias address `8+digit_index`. | Request edge → `FC2_BIAS_WAIT`. |
+| `FC2_BIAS_WAIT` | Wait for FC2 bias. | `bias_valid` → `FC2_GROUP_REQ`. |
+| `FC2_GROUP_REQ` | Compute and issue physical row requests for the current logical group. | Request issued → `FC2_WEIGHT_GATHER`. |
+| `FC2_WEIGHT_GATHER` | Capture the seven-cycle physical row and copy only the requested lanes into the logical group staging registers. | All required lanes present → `FC2_OPERAND_WAIT`; otherwise remain/wait for the response. |
+| `FC2_OPERAND_WAIT` | Wait for the layer-two hidden group response and completed weight staging. | Both valid → `FC2_MAC_START`. |
+| `FC2_MAC_START` | Start multiplier for the current logical group with hidden operands and selected weights. | Start accepted → `FC2_GROUP_WAIT`. |
+| `FC2_GROUP_WAIT` | Wait for current group completion. | Group complete → next group or `FC2_RESULT_WAIT`. |
+| `FC2_RESULT_WAIT` | Wait for the final FC2 accumulator result. | Result valid → `FC2_LOGIT_SEND`. |
+| `FC2_LOGIT_SEND` | Send the digit logit and its index/last marker to argmax. | Last digit sent → `COMPLETE_WAIT`; otherwise next `FC2_BIAS_REQ`. |
+| `COMPLETE_WAIT` | Wait for argmax completion and produce `done` for one cycle. | `argmax_done` → `IDLE`. |
+
+The FC2 mapping is fixed and must be implemented exactly as:
+
+```text
+flat_index = 8 * digit_index + hidden_index
+row_addr   = 896 + floor(flat_index / 7)
+row_lane   = flat_index % 7
+```
+
+Logical group zero uses hidden indices 0..6 and mask `7'b1111111`.  Logical
+group one uses hidden index 7 in lane 0 and mask `7'b0000001`.  In particular,
+physical row 907 has only lanes 0..2 valid; no controller state may treat its
+padding lanes as products.
+
+### Timing and protocol details
+
+- `start` is accepted only in `IDLE`; it is ignored while `busy` is high.
+- `busy` becomes high with the accepted start and remains high through the
+  argmax completion edge.  `done` is a one-cycle pulse and is never high with
+  a new start.
+- Requests are held for the exact memory contract: input and bias response at
+  the next cycle; weight response seven cycles after its request.  No address
+  counter advances merely because a request was asserted; it advances after
+  the corresponding valid response is consumed.
+- The controller never starts the multiplier until both operand sources and the
+  selected weight-valid mask are ready.  It never overwrites FC2 staging while
+  a current logical group is in use.
+
+### Verification checkpoints
+
+Check reset-to-`IDLE`, ignored starts while busy, exact FC1 row addresses,
+all 16 hidden results, all 10 FC2 digit iterations, FC2 row/lane regrouping,
+weight and input latency alignment, no counter wrap, one-cycle `done`, and a
+complete transaction with back-to-back legal memory responses.
+
+## 2. `input_memory`
+
+### Registers and planned blocks
+
+- Parameterize the depth as 784 FP16 entries and the group count as 112.
+- `pixel_mem[0:783]` is the read-only image storage; its contents are supplied
+  by the testbench or synthesis wrapper using `test_image.mem`.
+- A one-entry request/response valid register and seven 16-bit output
+  registers hold the registered response.
+- Use one `always_ff` block: reset clears response valid, lane mask, and outputs;
+  otherwise accept `read_req`, calculate the seven indices, and register the
+  response for the next cycle.  No separate combinational datapath is needed
+  beyond simple index selection.
+
+### Numbered steps
+
+1. Declare the 784-entry FP16 memory and the one-cycle response registers.
+2. On a legal request, read indices `7*group_addr + 0..6` in increasing order
+   and register all seven values with `lane_valid=7'b1111111`.
+3. On reset or an out-of-range address, clear `group_valid`, `lane_valid`, and
+   all output data; never wrap an address.
+
+### Verification checkpoints
+
+Exercise groups 0, 1, 110, and 111; consecutive requests; reset while a request
+is pending; and an invalid address.  Confirm response latency is exactly one
+cycle and lane ordering is preserved.
+
+## 3. `weight_sram`
+
+### Registers and planned blocks
+
+- Store 908 physical rows, each consisting of seven 16-bit lanes.  The physical
+  address space is 0..895 for FC1 and 896..907 for FC2.
+- Implement a request-delay pipeline parameterized as `LATENCY=7`; its indexing
+  must be chosen so a request accepted on edge N produces the response on edge
+  N+7 (the testbench timing assertion is the authority, avoiding an off-by-one
+  interpretation of pipeline stage numbering).  Valid bits and row addresses
+  shift every clock, and the final delay position drives the registered
+  seven-lane output and `row_valid`.
+- Use one `always_ff` block for reset, request-pipeline shifting, output
+  registers, and `lane_valid`.  Any lane-mask selection is a simple registered
+  comparison, not a second storage writer.
+
+### Numbered steps
+
+1. Declare the physical row storage (loaded externally from the supplied weight
+   files) and the seven-stage valid/address pipeline.
+2. On each edge shift pending requests; insert `read_req && row_addr<908` at
+   the input of the `LATENCY=7` delay path.
+3. At the delay position corresponding to N+7, register the selected row and
+   assert `row_valid`; emit full
+   mask `7'b1111111` except for row 907, which emits `7'b0000111`.
+4. On reset flush every valid stage and clear row outputs.
+
+### Verification checkpoints
+
+Verify exact seven-cycle latency, request ordering under consecutive requests,
+addresses 0, 895, 896, 906, and 907, invalid address behavior, and that no FC2
+logical regrouping occurs inside this module.
+
+## 4. `bias_memory`
+
+### Registers and planned blocks
+
+- Store 18 FP16 biases (loaded externally): addresses 0..7 are FC1 and 8..17
+  are FC2.
+- Use one `always_ff` block with a one-cycle request pipeline and registered
+  `bias_out`/`bias_valid`.
+
+### Numbered steps
+
+1. Declare the 18-entry FP16 storage and response registers.
+2. Register a legal request at the rising edge and return its bias at the next
+   rising edge.
+3. For reset or address 18..31, clear `bias_valid` and drive `bias_out` zero.
+
+### Verification checkpoints
+
+Check first/last address in each layer, consecutive requests, reset flushing,
+and exact one-cycle response timing.
+
+## 5. `fp16_multiplier`
+
+### Registers and planned blocks
+
+- Seven 16-bit operand capture registers, seven 16-bit weight capture registers,
+  and a seven-bit captured lane-valid mask.
+- A three-bit lane counter, `busy` state, product register, product-valid flag,
+  and group-done pulse.
+- Two states: `IDLE` and `RUN`.
+- One `always_ff` block captures a start, advances the lane counter, registers
+  each product, and emits the completion pulse.  One `always_comb` block selects
+  the current lane and computes the rounded FP16 product/control values with
+  blocking temporaries.
+
+### Numbered steps
+
+1. Accept `start` only in `IDLE`; capture all seven operands, weights, and the
+   lane mask in the same edge and enter `RUN`.
+2. In `RUN`, select exactly one lane per cycle, multiply in FP16, and emit
+   `product_valid` only when the captured mask says that lane is valid.  Invalid
+   lanes emit zero and no valid product.
+3. On lane six, assert `group_done` for one cycle, clear `busy`, and return to
+   `IDLE`.  The final product remains registered for the receiving handshake.
+4. Reset clears captures, counter, busy, product-valid, and group-done.
+
+### Timing and protocol details
+
+The seven lane opportunities are ordered 0 through 6.  A new start is not
+accepted while busy.  The arithmetic helper must implement binary16 sign,
+exponent, significand, normalization, rounding, zero, infinity, and NaN policy
+consistently with the project specification; it must not use FP32 or FMA.
+
+### Verification checkpoints
+
+Test positive/negative/zero products, exponent boundaries, rounding cases,
+invalid padding lanes, start-while-busy, reset during a run, lane order, and
+the group-done timing on the seventh lane.
+
+## 6. `ping_pong_buffer`
+
+### Registers and planned blocks
+
+- Two independent halves, each holding seven 16-bit product slots.
+- Per-half state (`EMPTY`, `WRITING`, `FULL`, `READING`), write/read position,
+  valid count, and a completion-order bit/age tag.  The age tag identifies the
+  oldest full half without relying on an unsafe simultaneous-read/write guess.
+- Current write-half and read-half selectors plus registered status outputs.
+- One `always_ff` block owns half memories, states, pointers, counts, and age
+  tags.  One `always_comb` block computes write/read selectors, ready/valid/
+  last status, and next state decisions.
+
+### Deterministic policy
+
+- A write begins in the lowest-index `EMPTY` half; after a half closes, the
+  next eligible empty half is selected in round-robin order.  This makes
+  behavior deterministic while allowing either half to be reused.
+- A consume begins with the oldest `FULL` half.  If both are full, the age tag
+  chooses the half that closed first.  A half that has just closed cannot be
+  reused for writing until it has returned to `EMPTY` on a later clock.
+
+### Numbered steps
+
+1. On reset, set both halves `EMPTY`, clear pointers/counts/age tags, and
+   deassert `buffer_empty`, `buffer_full`, and all handshakes.
+2. When `product_valid && write_ready` is true, write the product into the
+   selected half, increment its write position and valid count, and keep the
+   producer-facing ready signal stable for that edge.
+3. When `product_last` is accepted, close the writing half as `FULL`, record its
+   completion age, and select the other eligible empty half for a future group.
+   A last marker may close a group with fewer than seven valid products; no
+   invalid products are fabricated.
+4. When `consume_start` is accepted, select the oldest `FULL` half, enter
+   `READING`, and present its first stored product on the following cycle.
+5. While `consume_valid && consume_ready`, advance the read position.  Assert
+   `consume_last` on the final stored valid product; after that handshake mark
+   the half `EMPTY`, reset its count/pointers, and permit reuse from the next
+   cycle.
+6. Hold `consume_data`, `consume_valid`, and `consume_last` stable while
+   `consume_ready` is low.  Allow simultaneous write/read only when they target
+   different halves; never overwrite a half that is being read.
+
+### Protocol decisions
+
+`write_ready` means the selected writing half has capacity and a legal producer
+transaction can be accepted. In the published module contract, `buffer_full`
+means that at least one half is full and available for reading (it is a
+consumer-side availability indication, despite its name), while `buffer_empty`
+means that no stored product is available for reading. The implementation must
+preserve those documented meanings; write capacity is represented by
+`write_ready`. A zero-valid
+group close is a protocol error for the testbench to flag; the RTL does not
+invent a data word or add an unrequested error port.
+
+### Verification checkpoints
+
+Verify alternating groups, two groups arriving before consumption, producer
+back-pressure, consumer back-pressure, oldest-first ordering, partial final
+groups, simultaneous operations on opposite halves, attempted same-half reuse,
+reset during writing/reading, and data stability while not ready.
+
+## 7. `fp16_accumulator`
+
+### Registers and planned blocks
+
+- One 16-bit accumulated value, one captured bias, busy/active state, result
+  register, result-valid pulse, and readiness status.
+- One `always_ff` block for bias/result/state registers and accepted product
+  handshakes.  One `always_comb` block for the FP16 add result and next control
+  values.
+
+### Numbered steps
+
+1. Accept `accumulator_start` only while idle; capture the bias and initialize
+   the running sum to that bias.
+2. For every `product_valid && product_ready`, add exactly one FP16 product to
+   the running sum, with FP16 rounding after the add.
+3. When `neuron_last` is accepted with the final product (or with a valid
+   bias-only result if the interface explicitly permits it), register the
+   updated sum, assert `result_valid` for one cycle, clear busy, and return idle.
+4. Reset clears sum, bias, busy, result, and valid.
+
+### Verification checkpoints
+
+Check bias-first semantics, ordered products, final-product inclusion, FP16
+rounding at every add, back-pressure, start-while-busy, reset during accumulation,
+and result-valid pulse width.
+
+## 8. `layer2_register_file`
+
+### Registers and planned blocks
+
+- Ten 16-bit registers for hidden/logit inputs; only addresses 0..7 are writable
+  by the FC1 result path.  Addresses 8 and 9 remain reserved and are not
+  silently aliased.
+- One `always_ff` block for reset, hidden writes, and one-cycle group-read
+  response registers.  Address/lane selection may be expressed as combinational
+  next-data logic inside the same registered interface.
+
+### Numbered steps
+
+1. Reset all ten registers and clear read-valid/output registers.
+2. On `hidden_write_en` with address 0..7, store the ReLU result exactly once.
+3. On a legal group read, return group 0 as hidden 0..6 with mask
+   `7'b1111111`, or group 1 as hidden 7 in lane 0 with mask `7'b0000001`, after
+   the specified one-cycle latency.
+4. Reject/zero invalid group and write addresses; never overwrite hidden values
+   during the FC2 digit loop.
+
+### Verification checkpoints
+
+Write/read every hidden index, read both groups, check lane masks and ordering,
+check reserved addresses, and verify reset and consecutive reads.
+
+## 9. `relu`
+
+### Registers and planned blocks
+
+This is a stateless combinational module: one `always_comb` block, no clock,
+reset, or storage.  All assignments in the block are blocking and all outputs
+receive a default on every evaluation.
+
+### Numbered steps
+
+1. Default `data_out=16'h0000` and `valid_out=valid_in`.
+2. If `valid_in` is low, keep the zero output.
+3. If valid and the FP16 sign bit is one, output positive zero (`16'h0000`),
+   including for negative zero and negative finite values.
+4. Otherwise pass the input bit pattern unchanged, preserving positive values,
+   positive infinity, and the project-defined NaN behavior.
+
+### Verification checkpoints
+
+Test positive/negative finite values, positive and negative zero, infinity, NaN
+policy, invalid input, and combinational response with no hidden cycle.
+
+## 10. `argmax`
+
+### Registers and planned blocks
+
+- Ten 16-bit logit output registers (`logit0_out` through `logit9_out`) that
+  are written by index and held stable until the next `start` or reset.
+- Ten-input collection control: current index, `best_index`, `best_logit`, and a
+  `seen_valid` flag.
+- `busy`, `done`, and stable prediction output registers.
+- FSM states `IDLE` and `COLLECT`.
+- One `always_ff` block for state, best-value registers, and output pulses.  One
+  `always_comb` block for strict FP16 comparison and next-state/control logic.
+
+### Numbered steps
+
+1. In `IDLE`, accept `argmax_start`, clear `seen_valid`, clear the ten stored
+   logit registers (so no previous transaction is exposed), and enter
+   `COLLECT`.
+2. For each valid logit with index 0..9, write the corresponding logit register,
+   initialize the best value on the first valid sample, and thereafter replace
+   it only when the new logit is strictly greater.  Equal values retain the
+   earlier, lower index.
+3. On the valid final (`logit_last`) sample, include that sample in the compare,
+   register the final prediction, pulse `done` for one cycle, and return to
+   `IDLE`.
+4. Ignore starts while busy.  Invalid indices or an early invalid last marker
+   are not consumed; the controller is responsible for producing the legal
+   ten-logit sequence.
+5. Reset clears state, best registers, prediction, busy, and done.
+
+### Verification checkpoints
+
+Check increasing, decreasing, and tied logits; tie-low behavior; final-sample
+selection; invalid input; start-while-busy; reset during collection; and stable
+prediction after `done` until the next start/reset.
+
+## Integration order and plan-to-code review
+
+Implement and unit-test in this order: memories (`input_memory`, `weight_sram`,
+`bias_memory`), stateless arithmetic/control (`relu` and the FP16 arithmetic
+helpers), reusable datapath (`fp16_multiplier`, `fp16_accumulator`), storage
+(`ping_pong_buffer`, `layer2_register_file`), `argmax`, and finally
+`controller_fsm` plus the top-level wiring.  The controller must not be used to
+hide an unresolved submodule protocol.
+
+Before accepting `code.v_05`, review it against this file and confirm:
+
+- every planned register has one owner and reset value;
+- every planned `always_ff`/`always_comb` block exists with the stated role;
+- every FSM state and transition is represented;
+- all `// Step N:` comments map to a step in this document;
+- no RTL behavior was added without either a corresponding plan step or an
+  explicit revision to this plan;
+- unit tests cover every verification checkpoint above; and
+- the implementation report explicitly states whether the final code follows
+  this plan and lists any justified deviations.

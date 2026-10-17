@@ -1,0 +1,406 @@
+# Section 3 - Behavioral specifications
+
+This document is the behavioral contract for every module in the Section 2
+partition. It is written before RTL implementation and follows the Section 3
+requirements from `HW1-1.pdf`: reset type and values, bit widths and signedness,
+default behavior, invalid-input behavior, complete FSM state behavior, and
+cycle-by-cycle timing are stated explicitly.
+
+The module headers and architectural responsibilities remain in
+`partitioning.md_02` and the individual Section 2 blueprint files.
+
+## 1. Global conventions
+
+### 1.1 Clock, reset, and cycle terminology
+
+- All sequential modules use a positive-edge clock named `clk`.
+- `rst` is synchronous and active high. A module changes to its reset state
+  only on a rising edge for which `rst == 1`.
+- A request sampled on rising edge `N` is said to be accepted at cycle `N`.
+- Unless a module states another latency, a registered response visible after
+  the next rising edge is the response at cycle `N + 1`.
+- Reset has priority over every request, valid, ready, and state transition.
+- A one-cycle pulse is high for exactly one clock interval between two rising
+  edges.
+
+### 1.2 Data representation
+
+- Every FP16 value is a 16-bit `logic [15:0]` bit pattern representing IEEE-754
+  binary16. The ports are not signed integers; arithmetic modules interpret
+  the bit patterns as FP16.
+- Addresses, indices, counts, masks, and control signals are unsigned logic
+  vectors.
+- Supplied arithmetic inputs are finite FP16 values. The design need not
+  generate IEEE-754 NaNs or infinities.
+- Every multiplication is rounded to FP16 before it is presented as a product.
+- Every addition is rounded to FP16 before the accumulator stores the result.
+- No FP32 accumulator, fused multiply-add, reduction tree, or reordering is
+  permitted.
+
+### 1.3 Validity and ignored inputs
+
+- A value is consumed only in a cycle in which its corresponding `valid` is
+  high and the receiving interface is ready, when a ready signal exists.
+- Data and indices on an invalid cycle are ignored and may be driven to zero
+  by the producer for deterministic simulation.
+- A request received while a stateful unit is busy is ignored unless the
+  module's specific section says that it is queued. No module queues requests
+  implicitly.
+- Undefined addresses and indices never alter architectural state. Their
+  response is invalid and their data outputs are zero unless otherwise stated.
+
+## 2. `input_memory`
+
+### 2.1 Stored contents and address interpretation
+
+The memory contains exactly 784 FP16 pixels, in the order of
+`test_image.mem`. A seven-pixel group request uses:
+
+```text
+pixel_index = 7 * group_addr + lane
+group_addr  = 0 .. 111
+lane        = 0 .. 6
+```
+
+Every legal group has seven valid lanes because 784 is divisible by seven.
+
+### 2.2 Sequential behavior
+
+| Condition at rising edge | State/output after the edge |
+|---|---|
+| `rst == 1` | `group_valid=0`, `lane_valid=0`, and all seven outputs are `16'h0000`. Any pending read is discarded. |
+| `rst == 0`, `read_req=1`, `group_addr <= 111` | The request is registered. One cycle later, `group_valid=1`, all seven outputs contain the requested pixels, and `lane_valid=7'b1111111`. |
+| `rst == 0`, `read_req=0` | No new request is accepted. `group_valid=0` on the next cycle. |
+| `group_addr >= 112` | The request is invalid and has no architectural effect. The response is `group_valid=0`, `lane_valid=0`, and all data outputs zero. |
+
+Consecutive legal requests are returned in order, one response per cycle after
+the one-cycle read latency.
+
+## 3. `weight_sram`
+
+### 3.1 Stored contents and address interpretation
+
+The logical row address is 10 bits and maps as follows:
+
+| Row address | Logical contents |
+|---:|---|
+| `0 .. 895` | Seven consecutive values from flattened `fc1_weights.mem` |
+| `896 .. 907` | Seven consecutive physical positions from flattened `fc2_weights.mem` |
+| `908 .. 1023` | Undefined/reserved; never a legal request |
+
+For a legal row, output lanes are ordered lane 0 through lane 6. The output
+row is 112 bits conceptually, represented by seven registered 16-bit outputs.
+
+### 3.2 Seven-cycle latency
+
+If `read_req=1` and `row_addr` is legal at edge `N`, the SRAM accepts the
+request. Exactly seven rising edges later, at edge `N+7`, it asserts
+`row_valid=1` for one cycle and presents the corresponding seven registered
+weights and `lane_valid`. Requests accepted on consecutive edges produce
+responses on consecutive edges in the same order. Reset flushes all pending
+requests.
+
+### 3.3 Reset and invalid requests
+
+| Condition | Required behavior |
+|---|---|
+| `rst=1` at an edge | Clear the request pipeline, clear `row_valid` and `lane_valid`, and drive all weight outputs to zero. |
+| Legal request | Accept it even if another legal request was accepted on the preceding cycle; the seven-cycle pipeline preserves order. |
+| `row_addr >= 908` | Do not create a valid response. Return zero data with `row_valid=0` if a response slot is generated. |
+| Padding lane | `lane_valid[k]=0` means that lane is not a weight and must not create a multiplier product. |
+
+The actual `fc2_weights.mem` contains 80 values. Therefore row 907 contains
+three valid values in lanes 0..2 and four padding positions in lanes 3..6;
+its physical `lane_valid` is `7'b0000111`. This decision is used throughout
+the remaining specification.
+
+For a second-layer digit `d` and hidden index `h`, the physical location is:
+
+```text
+flat_index = 8 * d + h
+row_addr   = 896 + floor(flat_index / 7)
+row_lane   = flat_index % 7
+```
+
+The SRAM returns physical rows. The controller captures and selects the
+required lanes into a logical group before asserting `multiplier_start`; the
+multiplier never pairs a weight from one digit with an input from another.
+
+## 4. `bias_memory`
+
+### 4.1 Address map
+
+The memory contains exactly 18 FP16 values:
+
+```text
+bias_addr 0 .. 7   -> fc1_bias[n], n = 0 .. 7
+bias_addr 8 .. 17  -> fc2_bias[d], d = 0 .. 9
+```
+
+### 4.2 Behavior
+
+A legal `read_req` sampled at edge `N` returns `bias_valid=1` and the selected
+`bias_out` at edge `N+1`. `bias_valid` is a one-cycle pulse. Requests can be
+accepted on consecutive cycles and responses remain ordered.
+
+Reset drives `bias_valid=0` and `bias_out=16'h0000`. Addresses 18 through 31
+are invalid: they produce no valid response and never change memory contents.
+
+## 5. `fp16_multiplier`
+
+### 5.1 Group capture
+
+`start_group` is accepted only when `busy=0` and `rst=0`. At acceptance, the
+module captures all seven input operands, all seven weight operands, and the
+seven-bit `lane_valid` mask. A `start_group` while busy is ignored; the
+currently active group is never overwritten.
+
+### 5.2 Product schedule
+
+The captured group is visited in fixed lane order:
+
+| Active cycle after acceptance | `product_index` | Required result |
+|---:|---:|---|
+| 0 | 0 | Product 0 if `lane_valid[0]=1`; otherwise invalid/zero |
+| 1 | 1 | Product 1 if `lane_valid[1]=1`; otherwise invalid/zero |
+| 2 | 2 | Product 2 if `lane_valid[2]=1`; otherwise invalid/zero |
+| 3 | 3 | Product 3 if `lane_valid[3]=1`; otherwise invalid/zero |
+| 4 | 4 | Product 4 if `lane_valid[4]=1`; otherwise invalid/zero |
+| 5 | 5 | Product 5 if `lane_valid[5]=1`; otherwise invalid/zero |
+| 6 | 6 | Product 6 if `lane_valid[6]=1`; otherwise invalid/zero; `group_done=1` |
+
+On a valid lane, the output is exactly `FP16(weight[k] * input[k])`,
+`product_valid=1`, and `product_out` is the rounded FP16 result. On an invalid
+lane, `product_valid=0` and `product_out=16'h0000`; no multiplication result
+is architecturally produced. `group_done` is asserted only for the final
+lane-position cycle, even when lane 6 is invalid.
+
+`busy` is high from group acceptance through the cycle carrying
+`group_done`. It clears at the following rising edge. Reset aborts the group,
+clears `busy`, `product_valid`, `group_done`, `product_out`, and
+`product_index`.
+
+## 6. `ping_pong_buffer`
+
+### 6.1 Half states
+
+Each seven-entry half is always in exactly one of these states:
+
+| State | Meaning | Legal transition |
+|---|---|---|
+| `EMPTY` | No unread products are stored. | `product_valid && write_ready` writes the first product and enters `WRITING`. |
+| `WRITING` | Current multiplier group is being collected. | Valid products append in order. `product_last` closes the group and enters `FULL`. |
+| `FULL` | A complete group is waiting for the accumulator. | `consume_start` enters `READING`; otherwise it remains `FULL`. |
+| `READING` | Stored products are offered in order. | A final accepted product enters `EMPTY`; otherwise it remains `READING`. |
+
+The two halves may be in different states simultaneously. A half is never
+written while it is `FULL` or `READING`, and a half is never read while it is
+`EMPTY` or `WRITING`.
+
+### 6.2 Write behavior
+
+If `product_valid=1` and `write_ready=1`, `product_in` is written to the next
+free position. If `product_valid=1` and `write_ready=0`, the producer must
+hold the product and its valid indication; the buffer does not silently drop
+it. `product_last` closes the group after all valid products in that group
+have been counted. Invalid multiplier positions are not written.
+
+The controller must never start a group that would require more than seven
+valid products in one half.
+
+### 6.3 Read behavior
+
+`consume_start` is accepted only for a `FULL` half. While reading, the buffer
+holds `consume_data` and `consume_last` stable until
+`consume_valid && consume_ready` is true. `consume_last=1` accompanies the
+last stored valid product, not an invalid/padding position. After that product
+is accepted, the half becomes `EMPTY` and can eventually be selected for
+writing.
+
+Reset returns both halves to `EMPTY`, clears all valid/full/empty indicators,
+and drives all data/status outputs inactive.
+
+## 7. `fp16_accumulator`
+
+### 7.1 Neuron initialization
+
+`neuron_start` is accepted only while `busy=0`. It loads `bias_in` directly
+into the FP16 accumulator; the bias is not added through a product cycle.
+The first accepted product is added to that bias.
+
+If `neuron_start` is asserted while busy, it is ignored. Reset clears the
+accumulator, `busy`, `result_valid`, and `result_out`.
+
+### 7.2 Product acceptance and ordered fold
+
+When `product_valid && product_ready` is high, the module performs exactly one
+FP16 addition:
+
+```text
+new_acc = FP16(old_acc + product_in)
+```
+
+`group_last` marks the end of one seven-position buffer group but does not
+alter the accumulator. Products in later groups continue the same left fold.
+`product_valid` while `product_ready=0` is not consumed; the buffer must hold
+the product stable.
+
+When `neuron_last=1` accompanies the final accepted product, `result_out`
+receives the *updated* sum and `result_valid` pulses for one cycle. The result
+must include that final product. `busy` clears after completion.
+
+## 8. `layer2_register_file`
+
+### 8.1 Storage and writes
+
+The ten entries reset to `16'h0000`. Hidden writes are accepted only when
+`hidden_write_en=1` and `hidden_write_addr` is 0 through 7. Addresses 8 and 9
+are reserved and a write to them is ignored. A valid write takes effect on the
+accepting rising edge.
+
+### 8.2 Group reads
+
+A legal `group_read_req` is registered and returns one cycle later:
+
+| `group_addr` | Lane contents | `lane_valid` |
+|---:|---|---|
+| 0 | hidden[0] through hidden[6] | `7'b1111111` |
+| 1 | hidden[7] in lane 0; lanes 1 through 6 unused | `7'b0000001` |
+
+`group_valid=1` only for the response cycle. An invalid group address cannot
+occur with the one-bit port; reset clears `group_valid`, `lane_valid`, and all
+entries. The hidden values must not be overwritten while any second-layer
+neuron still needs them.
+
+## 9. `relu`
+
+`relu` is combinational and has no state, clock, or reset. For a valid input:
+
+| `data_in[15]` | Meaning for finite FP16 input | `data_out` |
+|---:|---|---|
+| 0 | Positive value or positive zero | Exact unchanged 16-bit input |
+| 1 | Negative value or negative zero | `16'h0000` |
+
+`valid_out` is exactly `valid_in`. When `valid_in=0`, `data_out` is driven to
+`16'h0000` for deterministic simulation and must be ignored by storage. This
+normalizes negative zero to positive zero.
+
+## 10. `argmax`
+
+### 10.1 Collection states
+
+| State | Behavior | Transition |
+|---|---|---|
+| `IDLE` | `busy=0`, waiting for `start`; previous outputs remain stable until a new start or reset. | Legal `start` -> clear transaction storage and enter `COLLECT`. |
+| `COLLECT` | `busy=1`; accept valid logits with indices 0..9 and compare them. | Valid `logit_last` for the final logit -> store result, pulse `done`, enter `IDLE`. |
+| `DONE` | Not a persistent state; `done` is a one-cycle registered pulse associated with completion. | Next cycle returns to `IDLE`. |
+
+`start` while `COLLECT` is ignored. `logit_valid=0` causes no write or
+comparison. A valid index 10 through 15 is invalid and is ignored. A
+`logit_last` without a valid logit is ignored; the controller must assert it
+with the final valid digit logit.
+
+### 10.2 Comparison and tie behavior
+
+The first accepted valid logit initializes the running maximum and prediction.
+Each later valid logit replaces the running maximum only if it is strictly
+greater than the current maximum. Equality never replaces the existing index,
+so the lowest index wins a tie when logits arrive in digit order.
+
+Each valid logit is also written to its corresponding `logitN_out` register.
+After the final logit, all ten outputs and `prediction` remain stable until
+the next `start` or reset. Reset clears all ten outputs, `prediction`,
+`busy`, and `done`.
+
+## 11. `controller_fsm`
+
+### 11.1 Controller invariants
+
+- `start` is accepted only in `IDLE`; a start while busy is ignored.
+- `busy=1` in every state except `IDLE` and the completion return cycle.
+- All output request pulses are low by default and are asserted only in the
+  state that owns the request.
+- A memory/datapath response that is not valid does not advance the FSM.
+- All counters have explicit bounds: first-layer neuron 0..7, first-layer
+  group 0..111, second-layer digit 0..9, and second-layer logical input
+  positions 0..7.
+- In the second layer, the controller owns non-arithmetic staging registers
+  for physical SRAM rows. It never starts the multiplier until the selected
+  lanes for one digit's logical group are assembled.
+
+### 11.1a Controller status interface
+
+The `controller_fsm` official header includes these status inputs in addition
+to its clock, reset, start, operand, and datapath inputs:
+
+| Input | Source | Sampling rule |
+|---|---|---|
+| `bias_valid` | `bias_memory.bias_valid` | Capture the bias only on its one-cycle response pulse. |
+| `layer2_group_valid` | `layer2_register_file.group_valid` | Capture hidden operands only on the registered group response. |
+| `buffer_full` | `ping_pong_buffer.buffer_full` | Assert `buffer_consume_start` only when an oldest full half is available. |
+| `buffer_consume_valid` | `ping_pong_buffer.consume_valid` | Qualifies the buffered product and its last marker. |
+| `buffer_consume_ready` | `fp16_accumulator.product_ready` | Indicates that the current buffered product is accepted. |
+
+`buffer_consume_last` remains the buffer's last-product indicator. A group is
+consumed, and the controller may advance its group counter, only when
+`buffer_consume_valid && buffer_consume_ready && buffer_consume_last` is true
+in the same cycle. This rule is required for partial groups and for stable
+data under consumer back-pressure. These inputs do not add arithmetic or
+change any module's responsibility.
+
+### 11.2 Complete state list
+
+| State | Main outputs | Advance condition | Next state |
+|---|---|---|---|
+| `IDLE` | `busy=0`; no requests | `start=1` | `FC1_BIAS_REQ` |
+| `FC1_BIAS_REQ` | Request bias address `fc1_neuron` | Request pulse issued | `FC1_BIAS_WAIT` |
+| `FC1_BIAS_WAIT` | Wait for `bias_valid` | Bias valid | `FC1_INPUT_REQ` |
+| `FC1_INPUT_REQ` | Request input group `fc1_group` and corresponding weight row | Both requests issued | `FC1_OPERAND_WAIT` |
+| `FC1_OPERAND_WAIT` | Hold addresses/control; no multiplier start | Input group and SRAM row valid and buffer writable | `FC1_MAC_START` |
+| `FC1_MAC_START` | Pulse `multiplier_start`, pulse accumulator start only for the first group | Start pulse issued | `FC1_GROUP_WAIT` |
+| `FC1_GROUP_WAIT` | Wait for multiplier/buffer/accumulator group completion | Accepted last product: `buffer_consume_valid && buffer_consume_ready && buffer_consume_last` | If `fc1_group==111`, `FC1_RESULT_WAIT`; else increment group and return to `FC1_INPUT_REQ` |
+| `FC1_RESULT_WAIT` | Wait for `accumulator_result_valid` | Result valid | `FC1_RELU_STORE` |
+| `FC1_RELU_STORE` | Enable hidden write at `fc1_neuron` | Write enabled | If neuron 7, `FC2_BIAS_REQ`; else increment neuron and go to `FC1_BIAS_REQ` |
+| `FC2_BIAS_REQ` | Request bias address `8 + fc2_digit` | Request pulse issued | `FC2_BIAS_WAIT` |
+| `FC2_BIAS_WAIT` | Wait for `bias_valid` | Bias valid | `FC2_GROUP_REQ` |
+| `FC2_GROUP_REQ` | Request layer-two hidden group and the first required physical weight row | Request issued | `FC2_WEIGHT_GATHER` |
+| `FC2_WEIGHT_GATHER` | Capture each required physical SRAM row and select lanes using `flat_index = 8*digit + hidden_index` | All lanes for the current logical group assembled | `FC2_OPERAND_WAIT` |
+| `FC2_OPERAND_WAIT` | Wait for `layer2_group_valid` and an available buffer; hold the assembled logical weight group | Hidden response valid and writable | `FC2_MAC_START` |
+| `FC2_MAC_START` | Pulse multiplier start and accumulator start | Start pulse issued | `FC2_GROUP_WAIT` |
+| `FC2_GROUP_WAIT` | Wait for the seven-position group and accumulation | Accepted last product: `buffer_consume_valid && buffer_consume_ready && buffer_consume_last` | If final logical input, `FC2_RESULT_WAIT`; else request next group |
+| `FC2_RESULT_WAIT` | Wait for final accumulator result | Result valid | `FC2_LOGIT_SEND` |
+| `FC2_LOGIT_SEND` | Pulse argmax logit valid with current digit index; assert logit last for digit 9 | Pulse issued | If digit 9, `COMPLETE_WAIT`; else increment digit and return to `FC2_BIAS_REQ` |
+| `COMPLETE_WAIT` | Hold outputs; no new transaction | `argmax_done` | `IDLE` with one-cycle `done` pulse |
+
+`FC2_WEIGHT_GATHER` may issue more than one physical SRAM request for one
+logical group because a digit's eight flattened weights can cross a physical
+seven-value row boundary. It advances only after every selected lane has been
+captured and invalid/padding lanes have been excluded.
+
+### 11.3 Reset and default outputs
+
+At reset, the FSM enters `IDLE`, clears all counters and request pulses, and
+drives `busy=0`, `done=0`, and all addresses to zero. Any unlisted or illegal
+state must recover to `IDLE` on the next rising edge with all request pulses
+deasserted.
+
+## 12. Resolved second-layer interpretation
+
+The supplied `fc2_weights.mem` has 80 values, so physical row 907 has three
+valid values and four padding positions. The design uses
+`lane_valid = 7'b0000111` for that row.
+
+The physical SRAM layout remains globally flattened, while the logical MAC
+order remains per digit. The controller performs the explicit lane-selection
+and regrouping step before each second-layer multiplier start:
+
+```text
+flat_index = 8 * digit + hidden_index
+row_addr   = 896 + floor(flat_index / 7)
+row_lane   = flat_index % 7
+```
+
+Each digit is evaluated as two logical groups: hidden indices 0..6, then
+hidden index 7 with six invalid lanes. This preserves the reference model's
+ordered FP16 MAC without changing the input files or pairing weights across
+digits.

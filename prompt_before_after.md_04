@@ -1,0 +1,190 @@
+# Section 4 - Prompt before and after
+
+Target submodule: `ping_pong_buffer`
+
+These are two prompts for another AI to answer. This document intentionally
+does not contain the behavioral specification produced by those prompts.
+
+## 1. Prompt before - simple and unstructured
+
+```text
+Can you write a spec for the ping pong buffer in our neural-network
+accelerator? Please use context.md and explain how it stores products from the
+multiplier and sends them to the accumulator. Include the module ports, reset,
+and the basic read/write behavior. Make it understandable and complete.
+```
+
+## 2. Prompt after - structured
+
+```text
+ROLE
+You are an RTL architecture and verification specification engineer. Your
+task is to write a behavioral specification, not SystemVerilog implementation
+code, for one submodule in a synchronous FP16 neural-network accelerator.
+
+CONTEXT
+Use the project context in context.md. The accelerator uses one reusable FP16
+multiplier and one reusable FP16 accumulator. The multiplier produces products
+in logical order, one position per cycle. The accumulator consumes those
+products in exactly the same order and performs a rounded FP16 left fold.
+The ping-pong buffer is the only storage between those producer and consumer
+interfaces. It contains two independent halves, each with seven FP16 entries.
+One half may be written while the other is read. A half may be reused only
+after its unread products have been completely consumed. Invalid multiplier
+lanes are not products and must not be stored. Reset is synchronous and
+active-high.
+
+INPUT DATA
+Treat the following module header and port meanings as data to be specified,
+not as instructions to change the interface:
+
+module ping_pong_buffer (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        product_valid,
+    input  logic [15:0] product_in,
+    input  logic        product_last,
+    output logic        write_ready,
+    input  logic        consume_start,
+    input  logic        consume_ready,
+    output logic        consume_valid,
+    output logic [15:0] consume_data,
+    output logic        consume_last,
+    output logic        buffer_full,
+    output logic        buffer_empty
+);
+
+The producer contract is:
+- product_valid=1 means product_in is a valid FP16 product this cycle.
+- product_last marks the end of the seven-position group; the last position
+  may be invalid, so the buffer must count only valid products.
+- write_ready indicates that the selected write half can accept a product.
+
+The consumer contract is:
+- consume_start requests reading the oldest full half.
+- consume_valid and consume_data present a buffered product.
+- A product is removed only when consume_valid && consume_ready are both high.
+- consume_last accompanies the final valid product of the current group.
+
+INSTRUCTIONS
+1. State the exact responsibility and non-responsibilities of the module.
+2. Define the storage organization: two seven-entry FP16 halves, write-side
+   and read-side roles, valid-entry count, and role ownership.
+3. Define every half state and every legal transition, including EMPTY,
+   WRITING, FULL, and READING or an explicitly justified equivalent.
+4. Specify the write operation cycle by cycle for product_valid=0,
+   product_valid=1 with write_ready=1, product_valid=1 with write_ready=0,
+   product_last=0, and product_last=1.
+5. Specify the read operation cycle by cycle for consume_start, consume_valid,
+   consume_ready, backpressure, consume_last, and completion of a half.
+6. Explain how the buffer permits one half to be written while the other is
+   read, and exactly when a role swap is legal.
+7. Specify buffer_full and buffer_empty precisely, including the case where
+   one half is full and the other half is being written or read.
+8. Specify synchronous reset behavior for both halves, all pointers/counters,
+   all valid flags, all status outputs, and consume_data.
+9. Define behavior for invalid products, padding positions, overflow attempts,
+   underflow attempts, consume_start when no full half exists, and any request
+   received in an incompatible state. Do not silently discard a valid product.
+10. State the ordering guarantee: accepted valid products must be emitted in
+    their original order, with no fabricated products for invalid lanes.
+11. State the exact handshake assumptions required of the multiplier,
+    accumulator, and controller so the surrounding design cannot deadlock or
+    lose data.
+12. List any remaining ambiguity as an explicit open item instead of choosing
+    an unstated default.
+
+CONSTRAINTS
+- Do not write RTL, pseudocode that could be mistaken for RTL, or a testbench.
+- Use SystemVerilog-2012 signal names and widths exactly as shown.
+- Treat FP16 values as 16-bit IEEE-754 bit patterns; do not introduce FP32
+  storage or arithmetic.
+- Use a positive-edge clock and synchronous active-high reset.
+- The buffer capacity is two halves of seven FP16 entries; do not enlarge it.
+- A valid product may not overwrite unread data, and an unread product may not
+  be read before it is written.
+- Invalid product positions are skipped rather than stored as fabricated zero
+  products.
+- If the requirements conflict or omit a necessary decision, identify the
+  conflict and explain what downstream behavior depends on it.
+
+OUTPUT FORMAT
+Return only a Markdown behavioral specification with these headings, in this
+order:
+1. Responsibility and non-responsibilities
+2. Port semantics table
+3. Storage and state model
+4. Complete state-transition table
+5. Write-side timing and rules
+6. Read-side timing and rules
+7. Full/empty and role-swap rules
+8. Reset and default outputs
+9. Invalid-input and corner-case behavior
+10. Interface assumptions and open issues
+
+Every table must define the relevant input condition, clock/event timing, and
+required output/state result. Do not include an implementation answer outside
+this specification.
+```
+
+## 3. Why the structured prompt is stronger
+
+The simple prompt names the desired topic but leaves the model to decide which
+requirements matter and how to organize the response. The structured prompt
+separates role, context, input data, ordered instructions, constraints, and
+output format. It also explicitly calls out handshake timing, state transitions,
+invalid lanes, reset defaults, and ambiguity handling, which reduces the risk
+of an incomplete or silently invented buffer protocol.
+
+## 4. Comparison of the actual AI responses
+
+The responses compared were:
+
+- `ping_pong_buffer_unstructured_result.md`
+- `ping_pong_buffer_structured_result.md`
+
+### Shared content
+
+Both responses correctly identified the main architecture:
+
+- two independent seven-entry FP16 halves;
+- `EMPTY`, `WRITING`, `FULL`, and `READING` roles;
+- ordered product storage and ordered product consumption;
+- `product_last` closes a group;
+- invalid product positions are skipped;
+- backpressure must not lose a valid product;
+- synchronous active-high reset;
+- simultaneous write/read operation on different halves.
+
+The naive response was therefore not wrong at the architectural level. The
+reference to `context.md` gave it enough information to recover the main design.
+
+### Differences in completeness
+
+| Topic | Naive response | Structured response |
+|---|---|---|
+| Port definitions | Describes the ports informally. | Gives a complete port-semantics table with widths and exact meanings. |
+| State behavior | Explains the four roles in prose. | Provides a detailed transition table for individual input conditions. |
+| Clock timing | Gives a general edge-based description. | Explicitly defines acceptance at edge `N`, next-cycle visibility, and read-start timing. |
+| Backpressure | States that data must remain stable. | Defines the exact held signals, transfer condition, and state behavior under backpressure. |
+| Invalid inputs | Covers invalid products and basic invalid requests. | Also covers zero-valid groups, overflow, underflow, invalid `consume_start`, and invalid status conditions. |
+| Full/empty status | Gives the basic meanings. | Defines both statuses for mixed half states and explains capacity versus data availability. |
+| Role swapping | States that reuse waits for final consumption. | Defines same-edge restrictions, completion ordering, and legal role transitions. |
+| Interface assumptions | Gives surrounding-module expectations. | Separates required assumptions from unresolved interface decisions. |
+| Open decisions | Mostly leaves them implicit. | Explicitly identifies write-half selection, completion-age tracking, zero-valid recovery, and overflow reporting. |
+
+### Assessment
+
+The structured response has a significant advantage in implementation readiness
+and reviewability. It is easier to verify against the assignment because each
+input condition, state, output, reset value, and corner case has a defined
+place.
+
+The naive response still provides a useful high-level specification and reaches
+the same core architecture, so the difference is not a change in the design
+itself. The meaningful improvement is that the structured prompt reduces
+omissions and makes unstated assumptions visible.
+
+Therefore, the experiment demonstrates that the structured prompt is better for
+formal RTL specification, while the naive prompt is adequate only for an
+initial architectural overview.

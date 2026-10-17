@@ -1,0 +1,99 @@
+# Section 2 hardware partitioning
+
+This document is the pre-RTL blueprint. It defines what modules exist, the
+responsibility and header of each module, and the datapath/control connections.
+The individual module contracts are documented in the adjacent files:
+
+- `controller_fsm.md`
+- `input_memory.md`
+- `weight_sram.md`
+- `bias_memory.md`
+- `fp16_multiplier.md`
+- `ping_pong_buffer.md`
+- `fp16_accumulator.md`
+- `layer2_register_file.md`
+- `relu.md`
+- `argmax.md`
+
+## Datapath
+
+```text
+                         ┌────────────────┐
+                         │  weight_sram   │
+                         └───────┬────────┘
+                                 │ physical seven-FP16 row
+                                 ▼
+                         ┌────────────────┐
+                         │controller FSM  │
+                         │weight staging  │
+                         └───────┬────────┘
+                                 │ logical weight group
+┌───────────────┐                ▼
+│ input_memory  │──────► ┌────────────────┐
+└───────────────┘        │ fp16_multiplier│
+                         └───────┬────────┘
+                                 │ one FP16 product/cycle
+                                 ▼
+                         ┌────────────────┐
+                         │ping_pong_buffer│
+                         └───────┬────────┘
+                                 │ ordered products
+                                 ▼
+┌───────────────┐        ┌────────────────┐
+│ bias_memory   │──────► │fp16_accumulator│
+└───────────────┘        └───────┬────────┘
+                                 │
+                     ┌───────────┴───────────┐
+                     │                       │
+                 layer one              layer two
+                     ▼                       ▼
+               ┌──────────┐          ┌────────────┐
+               │   relu   │          │   argmax   │──► prediction/logits
+               └────┬─────┘          └────────────┘
+                    ▼
+          ┌─────────────────────┐
+          │layer2_register_file │
+          └──────────┬──────────┘
+                     │ eight hidden FP16 values
+                     └──────────────► fp16_multiplier
+```
+
+## Control plane
+
+`controller_fsm` drives all memory requests, group/neuron/digit indices,
+start pulses, and write enables. It observes the registered valid/busy/result
+signals and guarantees:
+
+1. first-layer neurons complete before second-layer work begins;
+2. products are consumed in input order;
+3. hidden activations remain intact for all ten second-layer neurons; and
+4. `done` is asserted only after all ten logits and the prediction are stored.
+
+The controller status interface is explicit. In addition to the signals in
+the controller header, it receives `bias_valid` from `bias_memory`,
+`layer2_group_valid` from `layer2_register_file`, `buffer_full`,
+`buffer_consume_valid`, and `buffer_consume_last` from `ping_pong_buffer`,
+and `buffer_consume_ready` from the accumulator's `product_ready` path. A
+buffer group is complete only when `buffer_consume_valid`,
+`buffer_consume_ready`, and `buffer_consume_last` are simultaneously high.
+This is the documented controller/buffer handshake; it is not inferred from
+the physical row or lane counters.
+
+## Resolved second-layer mapping
+
+The supplied `fc2_weights.mem` contains exactly 80 values. Therefore, physical
+row 907 contains three valid values and four padding positions, with
+`lane_valid = 7'b0000111`.
+
+The SRAM remains globally flattened, but the controller now owns the explicit
+non-arithmetic regrouping step. For digit `d` and hidden index `h`:
+
+```text
+flat_index = 8 * d + h
+row_addr   = 896 + floor(flat_index / 7)
+row_lane   = flat_index % 7
+```
+
+The controller gathers the selected lanes into the logical groups required by
+the MAC: hidden indices 0..6, followed by hidden index 7. This preserves the
+golden model's per-digit ordering without inventing a new weight file layout.
