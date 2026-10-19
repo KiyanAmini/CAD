@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="808" viewBox="0 0 1180 808" font-family="Helvetica,Arial,sans-serif">
+<defs><marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#333"/></marker></defs>
+<rect width="1180" height="808" fill="white"/>
+<text x="20" y="28" font-size="18" font-weight="bold">controller_fsm - state diagram (22 states, synchronous active-high reset to IDLE)</text>
+<text x="20" y="48" font-size="11.5" fill="#444">Order follows the numbered boxes; loops: FC1 group loop (gidx 0..111), FC1 neuron loop (nidx 0..7), FC2 group loop (fgroup 0..1), FC2 digit loop (didx 0..9)</text>
+<rect x="40" y="100" width="230" height="52" rx="6" fill="#fff7e6" stroke="#2f5597" stroke-width="1.5"/><text x="155.0" y="123.0" text-anchor="middle" font-size="13" font-weight="bold">1. IDLE</text><text x="155.0" y="139.0" text-anchor="middle" font-size="10.5" fill="#444">wait start</text>
+<rect x="310" y="100" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="425.0" y="123.0" text-anchor="middle" font-size="13" font-weight="bold">2. FC1_BIAS_REQ</text><text x="425.0" y="139.0" text-anchor="middle" font-size="10.5" fill="#444">bias_read_req</text>
+<rect x="580" y="100" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="695.0" y="123.0" text-anchor="middle" font-size="13" font-weight="bold">3. FC1_BIAS_WAIT</text><text x="695.0" y="139.0" text-anchor="middle" font-size="10.5" fill="#444">wait bias_valid</text>
+<rect x="850" y="100" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="965.0" y="123.0" text-anchor="middle" font-size="13" font-weight="bold">4. FC1_INPUT_WEIGHT_REQ</text><text x="965.0" y="139.0" text-anchor="middle" font-size="10.5" fill="#444">input+weight req</text>
+<rect x="850" y="198" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="965.0" y="221.0" text-anchor="middle" font-size="13" font-weight="bold">5. FC1_OPERAND_WAIT</text><text x="965.0" y="237.0" text-anchor="middle" font-size="10.5" fill="#444">in_seen &amp; wt_seen &amp; write_ready</text>
+<rect x="580" y="198" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="695.0" y="221.0" text-anchor="middle" font-size="13" font-weight="bold">6. FC1_MAC_START</text><text x="695.0" y="237.0" text-anchor="middle" font-size="10.5" fill="#444">multiplier_start</text>
+<rect x="310" y="198" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="425.0" y="221.0" text-anchor="middle" font-size="13" font-weight="bold">7. FC1_GROUP_WAIT</text><text x="425.0" y="237.0" text-anchor="middle" font-size="10.5" fill="#444">wait buffer_full</text>
+<rect x="40" y="198" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="155.0" y="221.0" text-anchor="middle" font-size="13" font-weight="bold">8. FC1_CONSUME_WAIT</text><text x="155.0" y="237.0" text-anchor="middle" font-size="10.5" fill="#444">valid&amp;ready&amp;last</text>
+<rect x="40" y="296" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="155.0" y="319.0" text-anchor="middle" font-size="13" font-weight="bold">9. FC1_RESULT_WAIT</text><text x="155.0" y="335.0" text-anchor="middle" font-size="10.5" fill="#444">wait result_valid</text>
+<rect x="310" y="296" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="425.0" y="319.0" text-anchor="middle" font-size="13" font-weight="bold">10. FC1_RELU_STORE</text><text x="425.0" y="335.0" text-anchor="middle" font-size="10.5" fill="#444">hidden_write_en</text>
+<rect x="580" y="296" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="695.0" y="319.0" text-anchor="middle" font-size="13" font-weight="bold">11. FC2_ARGMAX_START</text><text x="695.0" y="335.0" text-anchor="middle" font-size="10.5" fill="#444">argmax_start</text>
+<rect x="850" y="296" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="965.0" y="319.0" text-anchor="middle" font-size="13" font-weight="bold">12. FC2_BIAS_REQ</text><text x="965.0" y="335.0" text-anchor="middle" font-size="10.5" fill="#444">bias addr 8+d</text>
+<rect x="850" y="394" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="965.0" y="417.0" text-anchor="middle" font-size="13" font-weight="bold">13. FC2_BIAS_WAIT</text><text x="965.0" y="433.0" text-anchor="middle" font-size="10.5" fill="#444">wait bias_valid</text>
+<rect x="580" y="394" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="695.0" y="417.0" text-anchor="middle" font-size="13" font-weight="bold">14. FC2_GROUP_PREP</text><text x="695.0" y="433.0" text-anchor="middle" font-size="10.5" fill="#444">l2 read + weight row</text>
+<rect x="310" y="394" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="425.0" y="417.0" text-anchor="middle" font-size="13" font-weight="bold">15. FC2_GATHER_WAIT</text><text x="425.0" y="433.0" text-anchor="middle" font-size="10.5" fill="#444">gather lanes (2 rows max)</text>
+<rect x="40" y="394" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="155.0" y="417.0" text-anchor="middle" font-size="13" font-weight="bold">16. FC2_OPERAND_WAIT</text><text x="155.0" y="433.0" text-anchor="middle" font-size="10.5" fill="#444">mask ok &amp; write_ready</text>
+<rect x="40" y="492" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="155.0" y="515.0" text-anchor="middle" font-size="13" font-weight="bold">17. FC2_MAC_START</text><text x="155.0" y="531.0" text-anchor="middle" font-size="10.5" fill="#444">multiplier_start</text>
+<rect x="310" y="492" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="425.0" y="515.0" text-anchor="middle" font-size="13" font-weight="bold">18. FC2_GROUP_WAIT</text><text x="425.0" y="531.0" text-anchor="middle" font-size="10.5" fill="#444">wait buffer_full</text>
+<rect x="580" y="492" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="695.0" y="515.0" text-anchor="middle" font-size="13" font-weight="bold">19. FC2_CONSUME_WAIT</text><text x="695.0" y="531.0" text-anchor="middle" font-size="10.5" fill="#444">valid&amp;ready&amp;last</text>
+<rect x="850" y="492" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="965.0" y="515.0" text-anchor="middle" font-size="13" font-weight="bold">20. FC2_RESULT_WAIT</text><text x="965.0" y="531.0" text-anchor="middle" font-size="10.5" fill="#444">wait result_valid</text>
+<rect x="850" y="590" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="965.0" y="613.0" text-anchor="middle" font-size="13" font-weight="bold">21. FC2_LOGIT_SEND</text><text x="965.0" y="629.0" text-anchor="middle" font-size="10.5" fill="#444">argmax_logit_valid</text>
+<rect x="580" y="590" width="230" height="52" rx="6" fill="#eef3fb" stroke="#2f5597" stroke-width="1.5"/><text x="695.0" y="613.0" text-anchor="middle" font-size="13" font-weight="bold">22. COMPLETE_WAIT</text><text x="695.0" y="629.0" text-anchor="middle" font-size="10.5" fill="#444">wait argmax_done -> done</text>
+<line x1="270" y1="126.0" x2="310" y2="126.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="540" y1="126.0" x2="580" y2="126.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="810" y1="126.0" x2="850" y2="126.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="965.0" y1="152" x2="965.0" y2="198" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="850" y1="224.0" x2="810" y2="224.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="580" y1="224.0" x2="540" y2="224.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="310" y1="224.0" x2="270" y2="224.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="155.0" y1="250" x2="155.0" y2="296" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="270" y1="322.0" x2="310" y2="322.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="540" y1="322.0" x2="580" y2="322.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="810" y1="322.0" x2="850" y2="322.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="965.0" y1="348" x2="965.0" y2="394" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="850" y1="420.0" x2="810" y2="420.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="580" y1="420.0" x2="540" y2="420.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="310" y1="420.0" x2="270" y2="420.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="155.0" y1="446" x2="155.0" y2="492" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="270" y1="518.0" x2="310" y2="518.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="540" y1="518.0" x2="580" y2="518.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="810" y1="518.0" x2="850" y2="518.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="965.0" y1="544" x2="965.0" y2="590" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<line x1="850" y1="616.0" x2="810" y2="616.0" stroke="#333" stroke-width="1.6" marker-end="url(#a)"/>
+<text x="40" y="668" font-size="13" font-weight="bold">Loop-back and special transitions</text>
+<text x="40" y="688" font-size="11.5"><tspan font-weight="bold">FC1_CONSUME_WAIT -> FC1_INPUT_WEIGHT_REQ</tspan>: gidx &lt; 111 (next 7-weight group, same neuron)</text>
+<text x="40" y="705" font-size="11.5"><tspan font-weight="bold">FC1_RELU_STORE -> FC1_BIAS_REQ</tspan>: nidx &lt; 7 (next neuron); nidx == 7 -> FC2_ARGMAX_START</text>
+<text x="40" y="722" font-size="11.5"><tspan font-weight="bold">FC2_CONSUME_WAIT -> FC2_GROUP_PREP</tspan>: fgroup == 0 (second group: h[7] only)</text>
+<text x="40" y="739" font-size="11.5"><tspan font-weight="bold">FC2_LOGIT_SEND -> FC2_BIAS_REQ</tspan>: didx &lt; 9 (next digit); didx == 9 -> COMPLETE_WAIT</text>
+<text x="40" y="756" font-size="11.5"><tspan font-weight="bold">COMPLETE_WAIT -> IDLE</tspan>: argmax_done: done pulses for exactly one cycle</text>
+<text x="40" y="773" font-size="11.5"><tspan font-weight="bold">IDLE -> FC1_BIAS_REQ</tspan>: start accepted only while idle; start while busy ignored</text>
+</svg>

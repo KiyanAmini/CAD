@@ -1,0 +1,1141 @@
+// code.v_05 - Section 5 implementation, extracted verbatim from code.md.
+// Contains every ```systemverilog block of code.md in order; every relevant
+// line carries a '// Step N' comment that maps to plan.md_05.
+// NOTE: this is the historical Section-5 candidate. The verified, final RTL
+// that passes the golden vector is 06_2_programmer.v (Section 6).
+
+package fp16_pkg;
+
+  // Step 1: binary16 field helpers and exact finite-value representation.
+  function automatic logic fp16_is_nan(input logic [15:0] x);
+    fp16_is_nan = (&x[14:10]) && (|x[9:0]);
+  endfunction
+
+  function automatic logic fp16_is_inf(input logic [15:0] x);
+    fp16_is_inf = (&x[14:10]) && !(|x[9:0]);
+  endfunction
+
+  function automatic logic fp16_is_zero(input logic [15:0] x);
+    fp16_is_zero = (x[14:0] == 15'h0000);
+  endfunction
+
+  function automatic integer fp16_base(input logic [15:0] x);
+    if (x[14:10] == 5'd0)
+      fp16_base = -24;                 // subnormal: frac * 2^-24
+    else begin
+      fp16_base = x[14:10];
+      fp16_base = fp16_base - 25;       // (1024+frac) * 2^(exp-25)
+    end
+  endfunction
+
+  function automatic longint unsigned fp16_mant(input logic [15:0] x);
+    if (x[14:10] == 5'd0)
+      fp16_mant = x[9:0];
+    else
+      fp16_mant = 64'd1024 + x[9:0];
+  endfunction
+
+  // Step 2: round a nonnegative integer times 2^base into binary16.
+  function automatic [15:0] fp16_pack(
+      input logic sign,
+      input longint unsigned magnitude,
+      input integer base);
+    integer i;
+    integer msb;
+    integer shift;
+    integer unbiased_exp;
+    longint unsigned q;
+    longint unsigned remainder_mask;
+    logic [4:0] exp_field;
+    logic [9:0] frac_field;
+    logic guard_bit;
+    logic sticky_bit;
+    begin
+      fp16_pack = 16'h0000;
+      if (magnitude == 0) begin
+        fp16_pack = 16'h0000;           // normalize both signed zeros to +0
+      end else begin
+        msb = 0;
+        for (i = 0; i < 63; i = i + 1)
+          if (magnitude[i]) msb = i;
+        unbiased_exp = base + msb;
+
+        if (unbiased_exp > 15) begin
+          fp16_pack = {sign, 5'h1f, 10'h000};
+        end else if (unbiased_exp >= -14) begin
+          // Step 3: retain eleven significant bits and round ties to even.
+          shift = msb - 10;
+          if (shift > 0) begin
+            q = magnitude >> shift;
+            guard_bit = magnitude[shift-1];
+            if (shift > 1) begin
+              remainder_mask = (64'h1 << (shift-1)) - 1;
+              sticky_bit = ((magnitude & remainder_mask) != 0);
+            end else begin
+              sticky_bit = 1'b0;
+            end
+            if (guard_bit && (sticky_bit || q[0])) q = q + 1;
+          end else begin
+            q = magnitude << (-shift);
+          end
+          if (q >= 2048) begin
+            q = q >> 1;
+            unbiased_exp = unbiased_exp + 1;
+          end
+          if (unbiased_exp > 15)
+            fp16_pack = {sign, 5'h1f, 10'h000};
+          else begin
+            exp_field = unbiased_exp + 15;
+            frac_field = q - 1024;
+            fp16_pack = {sign, exp_field, frac_field};
+          end
+        end else begin
+          // Step 4: values below the normal range are rounded to subnormal
+          // units of 2^-24.  A rounded 1024 becomes the smallest normal.
+          shift = -(base + 24);
+          if (shift > 0) begin
+            q = magnitude >> shift;
+            guard_bit = magnitude[shift-1];
+            if (shift > 1) begin
+              remainder_mask = (64'h1 << (shift-1)) - 1;
+              sticky_bit = ((magnitude & remainder_mask) != 0);
+            end else begin
+              sticky_bit = 1'b0;
+            end
+            if (guard_bit && (sticky_bit || q[0])) q = q + 1;
+          end else begin
+            q = magnitude << (-shift);
+          end
+          if (q == 0)
+            fp16_pack = 16'h0000;
+          else if (q >= 1024)
+            fp16_pack = {sign, 5'd1, 10'd0};
+          else begin
+            frac_field = q[9:0];
+            fp16_pack = {sign, 5'd0, frac_field};
+          end
+        end
+      end
+    end
+  endfunction
+
+  // Step 5: exact integer-domain FP16 multiply, rounded once to binary16.
+  function automatic [15:0] fp16_mul(
+      input logic [15:0] a,
+      input logic [15:0] b);
+    longint unsigned ma;
+    longint unsigned mb;
+    longint unsigned product;
+    integer base_a;
+    integer base_b;
+    begin
+      if (fp16_is_nan(a) || fp16_is_nan(b)) begin
+        fp16_mul = 16'h7e00;
+      end else if ((fp16_is_inf(a) && fp16_is_zero(b)) ||
+                   (fp16_is_inf(b) && fp16_is_zero(a))) begin
+        fp16_mul = 16'h7e00;
+      end else if (fp16_is_inf(a) || fp16_is_inf(b)) begin
+        fp16_mul = {(a[15] ^ b[15]), 5'h1f, 10'h000};
+      end else if (fp16_is_zero(a) || fp16_is_zero(b)) begin
+        fp16_mul = 16'h0000;
+      end else begin
+        ma = fp16_mant(a);
+        mb = fp16_mant(b);
+        base_a = fp16_base(a);
+        base_b = fp16_base(b);
+        product = ma * mb;
+        fp16_mul = fp16_pack(a[15] ^ b[15], product, base_a + base_b);
+      end
+    end
+  endfunction
+
+  // Step 6: exact aligned FP16 addition, rounded once to binary16.
+  function automatic [15:0] fp16_add(
+      input logic [15:0] a,
+      input logic [15:0] b);
+    longint unsigned ma;
+    longint unsigned mb;
+    longint signed sa;
+    longint signed sb;
+    longint signed sum;
+    longint unsigned magnitude;
+    integer ba;
+    integer bb;
+    integer common_base;
+    integer shift_a;
+    integer shift_b;
+    begin
+      if (fp16_is_nan(a) || fp16_is_nan(b)) begin
+        fp16_add = 16'h7e00;
+      end else if (fp16_is_inf(a) && fp16_is_inf(b) && (a[15] != b[15])) begin
+        fp16_add = 16'h7e00;
+      end else if (fp16_is_inf(a)) begin
+        fp16_add = {a[15], 5'h1f, 10'h000};
+      end else if (fp16_is_inf(b)) begin
+        fp16_add = {b[15], 5'h1f, 10'h000};
+      end else begin
+        ma = fp16_mant(a);
+        mb = fp16_mant(b);
+        ba = fp16_base(a);
+        bb = fp16_base(b);
+        common_base = (ba < bb) ? ba : bb;
+        shift_a = ba - common_base;
+        shift_b = bb - common_base;
+        sa = $signed(ma);
+        sb = $signed(mb);
+        sa = sa <<< shift_a;
+        sb = sb <<< shift_b;
+        if (a[15]) sa = -sa;
+        if (b[15]) sb = -sb;
+        sum = sa + sb;
+        if (sum == 0) begin
+          fp16_add = 16'h0000;
+        end else begin
+          if (sum < 0) begin
+            magnitude = -sum;
+            fp16_add = fp16_pack(1'b1, magnitude, common_base);
+          end else begin
+            magnitude = sum;
+            fp16_add = fp16_pack(1'b0, magnitude, common_base);
+          end
+        end
+      end
+    end
+  endfunction
+
+  // Step 7: strict finite FP16 ordering for argmax.  Equal values are false.
+  function automatic logic fp16_gt(
+      input logic [15:0] a,
+      input logic [15:0] b);
+    logic a_zero;
+    logic b_zero;
+    logic mag_gt;
+    begin
+      fp16_gt = 1'b0;
+      a_zero = fp16_is_zero(a);
+      b_zero = fp16_is_zero(b);
+      if (fp16_is_nan(a) || fp16_is_nan(b)) begin
+        fp16_gt = 1'b0;
+      end else if (a_zero && b_zero) begin
+        fp16_gt = 1'b0;
+      end else if (a[15] != b[15]) begin
+        fp16_gt = !a[15];
+      end else begin
+        mag_gt = ({a[14:10], a[9:0]} > {b[14:10], b[9:0]});
+        fp16_gt = a[15] ? !mag_gt && !({a[14:10],a[9:0]} ==
+                                        {b[14:10],b[9:0]}) : mag_gt;
+      end
+    end
+  endfunction
+endpackage
+
+module input_memory (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        read_req,
+    input  logic [6:0]  group_addr,
+    output logic        group_valid,
+    output logic [15:0] input0_out,
+    output logic [15:0] input1_out,
+    output logic [15:0] input2_out,
+    output logic [15:0] input3_out,
+    output logic [15:0] input4_out,
+    output logic [15:0] input5_out,
+    output logic [15:0] input6_out,
+    output logic [6:0]  lane_valid
+);
+  // Step 1: memory and one-entry request pipeline.
+  logic [15:0] pixel_mem [0:783];
+  logic        pending_valid;
+  logic [6:0]  pending_group;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 3: synchronous reset flushes response state.
+      pending_valid <= 1'b0;
+      pending_group <= 7'd0;
+      group_valid   <= 1'b0;
+      lane_valid    <= 7'd0;
+      input0_out    <= 16'd0;
+      input1_out    <= 16'd0;
+      input2_out    <= 16'd0;
+      input3_out    <= 16'd0;
+      input4_out    <= 16'd0;
+      input5_out    <= 16'd0;
+      input6_out    <= 16'd0;
+    end else begin
+      // Step 2: return the request accepted on the preceding edge.
+      group_valid <= pending_valid;
+      if (pending_valid) begin
+        input0_out <= pixel_mem[pending_group*7 + 0];
+        input1_out <= pixel_mem[pending_group*7 + 1];
+        input2_out <= pixel_mem[pending_group*7 + 2];
+        input3_out <= pixel_mem[pending_group*7 + 3];
+        input4_out <= pixel_mem[pending_group*7 + 4];
+        input5_out <= pixel_mem[pending_group*7 + 5];
+        input6_out <= pixel_mem[pending_group*7 + 6];
+        lane_valid <= 7'b1111111;
+      end else begin
+        lane_valid <= 7'd0;
+      end
+      pending_valid <= read_req && (group_addr < 7'd112);
+      if (read_req && (group_addr < 7'd112))
+        pending_group <= group_addr;
+    end
+  end
+endmodule
+
+module weight_sram (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        read_req,
+    input  logic [9:0]  row_addr,
+    output logic        row_valid,
+    output logic [15:0] weight0_out,
+    output logic [15:0] weight1_out,
+    output logic [15:0] weight2_out,
+    output logic [15:0] weight3_out,
+    output logic [15:0] weight4_out,
+    output logic [15:0] weight5_out,
+    output logic [15:0] weight6_out,
+    output logic [6:0]  lane_valid
+);
+  // Step 1: physical seven-lane rows and LATENCY=7 request path.
+  logic [15:0] weight_mem [0:907][0:6];
+  logic        valid_pipe [0:6];
+  logic [9:0]  addr_pipe  [0:6];
+  integer i;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 4: flush all pending rows and visible outputs.
+      row_valid  <= 1'b0;
+      lane_valid <= 7'd0;
+      weight0_out <= 16'd0;
+      weight1_out <= 16'd0;
+      weight2_out <= 16'd0;
+      weight3_out <= 16'd0;
+      weight4_out <= 16'd0;
+      weight5_out <= 16'd0;
+      weight6_out <= 16'd0;
+      for (i = 0; i < 7; i = i + 1) begin
+        valid_pipe[i] <= 1'b0;
+        addr_pipe[i]  <= 10'd0;
+      end
+    end else begin
+      // Step 3: response from the delay position is exactly seven edges old.
+      row_valid <= valid_pipe[6];
+      if (valid_pipe[6]) begin
+        weight0_out <= weight_mem[addr_pipe[6]][0];
+        weight1_out <= weight_mem[addr_pipe[6]][1];
+        weight2_out <= weight_mem[addr_pipe[6]][2];
+        weight3_out <= weight_mem[addr_pipe[6]][3];
+        weight4_out <= weight_mem[addr_pipe[6]][4];
+        weight5_out <= weight_mem[addr_pipe[6]][5];
+        weight6_out <= weight_mem[addr_pipe[6]][6];
+        lane_valid <= (addr_pipe[6] == 10'd907) ? 7'b0000111 : 7'b1111111;
+      end else begin
+        lane_valid <= 7'd0;
+      end
+      for (i = 6; i > 0; i = i - 1) begin
+        valid_pipe[i] <= valid_pipe[i-1];
+        addr_pipe[i]  <= addr_pipe[i-1];
+      end
+      valid_pipe[0] <= read_req && (row_addr < 10'd908);
+      if (read_req && (row_addr < 10'd908)) addr_pipe[0] <= row_addr;
+    end
+  end
+endmodule
+
+module bias_memory (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        read_req,
+    input  logic [4:0]  bias_addr,
+    output logic        bias_valid,
+    output logic [15:0] bias_out
+);
+  // Step 1: eighteen-entry FP16 bias storage and one-cycle request path.
+  logic [15:0] bias_mem [0:17];
+  logic        pending_valid;
+  logic [4:0]  pending_addr;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 3: reset response state.
+      pending_valid <= 1'b0;
+      pending_addr  <= 5'd0;
+      bias_valid    <= 1'b0;
+      bias_out     <= 16'd0;
+    end else begin
+      // Step 2: registered one-cycle response.
+      bias_valid <= pending_valid;
+      if (pending_valid) bias_out <= bias_mem[pending_addr];
+      else bias_out <= 16'd0;
+      pending_valid <= read_req && (bias_addr < 5'd18);
+      if (read_req && (bias_addr < 5'd18)) pending_addr <= bias_addr;
+    end
+  end
+endmodule
+
+module relu (
+    input  logic [15:0] data_in,
+    input  logic        valid_in,
+    output logic [15:0] data_out,
+    output logic        valid_out
+);
+  // Steps 1–4: stateless FP16 sign test and valid propagation.
+  always_comb begin
+    data_out  = 16'h0000;
+    valid_out = valid_in;
+    if (valid_in && !data_in[15]) data_out = data_in;
+  end
+endmodule
+
+module fp16_multiplier (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        start_group,
+    input  logic [15:0] input0,
+    input  logic [15:0] input1,
+    input  logic [15:0] input2,
+    input  logic [15:0] input3,
+    input  logic [15:0] input4,
+    input  logic [15:0] input5,
+    input  logic [15:0] input6,
+    input  logic [15:0] weight0,
+    input  logic [15:0] weight1,
+    input  logic [15:0] weight2,
+    input  logic [15:0] weight3,
+    input  logic [15:0] weight4,
+    input  logic [15:0] weight5,
+    input  logic [15:0] weight6,
+    input  logic [6:0]  lane_valid,
+    output logic        busy,
+    output logic        product_valid,
+    output logic [15:0] product_out,
+    output logic [2:0]  product_index,
+    output logic        group_done
+);
+  import fp16_pkg::*;
+  // Step 1: captured seven-lane group and lane counter.
+  logic [15:0] input_reg [0:6];
+  logic [15:0] weight_reg[0:6];
+  logic [6:0]  lane_valid_reg;
+  logic [2:0]  lane;
+  integer i;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 4: clear datapath state.
+      busy <= 1'b0;
+      lane <= 3'd0;
+      lane_valid_reg <= 7'd0;
+      for (i = 0; i < 7; i = i + 1) begin
+        input_reg[i]  <= 16'd0;
+        weight_reg[i] <= 16'd0;
+      end
+    end else if (!busy && start_group) begin
+      // Step 1: accept a new group only while idle.
+      input_reg[0] <= input0; input_reg[1] <= input1;
+      input_reg[2] <= input2; input_reg[3] <= input3;
+      input_reg[4] <= input4; input_reg[5] <= input5;
+      input_reg[6] <= input6;
+      weight_reg[0] <= weight0; weight_reg[1] <= weight1;
+      weight_reg[2] <= weight2; weight_reg[3] <= weight3;
+      weight_reg[4] <= weight4; weight_reg[5] <= weight5;
+      weight_reg[6] <= weight6;
+      lane_valid_reg <= lane_valid;
+      lane <= 3'd0;
+      busy <= 1'b1;
+    end else if (busy) begin
+      // Steps 2–3: seven fixed lane opportunities, then return idle.
+      if (lane == 3'd6) busy <= 1'b0;
+      else lane <= lane + 3'd1;
+    end
+  end
+
+  always_comb begin
+    // Steps 2–3: invalid lanes never produce a valid product.
+    product_index = lane;
+    product_valid = busy && lane_valid_reg[lane];
+    group_done    = busy && (lane == 3'd6);
+    product_out   = 16'h0000;
+    if (product_valid) product_out = fp16_mul(input_reg[lane], weight_reg[lane]);
+  end
+endmodule
+
+module fp16_accumulator (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        neuron_start,
+    input  logic [15:0] bias_in,
+    input  logic        product_valid,
+    input  logic [15:0] product_in,
+    input  logic        group_last,
+    input  logic        neuron_last,
+    output logic        product_ready,
+    output logic        busy,
+    output logic [15:0] result_out,
+    output logic        result_valid
+);
+  import fp16_pkg::*;
+  logic [15:0] acc;
+  logic [15:0] add_result;
+
+  // Step 2: combinational rounded FP16 next sum.
+  always_comb begin
+    product_ready = busy;
+    add_result = fp16_add(acc, product_in);
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 4: clear accumulator and result state.
+      acc <= 16'd0;
+      busy <= 1'b0;
+      result_out <= 16'd0;
+      result_valid <= 1'b0;
+    end else begin
+      result_valid <= 1'b0;
+      if (!busy && neuron_start) begin
+        // Step 1: bias is the initial FP16 sum.
+        acc <= bias_in;
+        busy <= 1'b1;
+      end else if (busy && product_valid) begin
+        // Step 2: group_last is only a boundary; it never resets acc.
+        if (neuron_last) begin
+          // Step 3: publish the sum including the final product.
+          result_out <= add_result;
+          result_valid <= 1'b1;
+          acc <= add_result;
+          busy <= 1'b0;
+        end else begin
+          acc <= add_result;
+        end
+      end
+    end
+  end
+endmodule
+
+module layer2_register_file (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        hidden_write_en,
+    input  logic [2:0]  hidden_write_addr,
+    input  logic [15:0] hidden_write_data,
+    input  logic        group_read_req,
+    input  logic        group_addr,
+    output logic        group_valid,
+    output logic [15:0] input0_out,
+    output logic [15:0] input1_out,
+    output logic [15:0] input2_out,
+    output logic [15:0] input3_out,
+    output logic [15:0] input4_out,
+    output logic [15:0] input5_out,
+    output logic [15:0] input6_out,
+    output logic [6:0]  lane_valid
+);
+  // Steps 1–2: ten-entry register file; entries 8 and 9 are reserved.
+  logic [15:0] hidden_reg [0:9];
+  logic        pending_valid;
+  logic        pending_group;
+  integer i;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 1: clear storage and read response.
+      for (i = 0; i < 10; i = i + 1) hidden_reg[i] <= 16'd0;
+      pending_valid <= 1'b0;
+      pending_group <= 1'b0;
+      group_valid <= 1'b0;
+      lane_valid <= 7'd0;
+      input0_out <= 16'd0; input1_out <= 16'd0;
+      input2_out <= 16'd0; input3_out <= 16'd0;
+      input4_out <= 16'd0; input5_out <= 16'd0;
+      input6_out <= 16'd0;
+    end else begin
+      // Step 3: one-cycle registered group response.
+      group_valid <= pending_valid;
+      if (pending_valid) begin
+        if (!pending_group) begin
+          input0_out <= hidden_reg[0]; input1_out <= hidden_reg[1];
+          input2_out <= hidden_reg[2]; input3_out <= hidden_reg[3];
+          input4_out <= hidden_reg[4]; input5_out <= hidden_reg[5];
+          input6_out <= hidden_reg[6];
+          lane_valid <= 7'b1111111;
+        end else begin
+          input0_out <= hidden_reg[7];
+          input1_out <= 16'd0; input2_out <= 16'd0;
+          input3_out <= 16'd0; input4_out <= 16'd0;
+          input5_out <= 16'd0; input6_out <= 16'd0;
+          lane_valid <= 7'b0000001;
+        end
+      end else begin
+        lane_valid <= 7'd0;
+      end
+      // Step 2: writes only target hidden entries 0..7.
+      if (hidden_write_en) hidden_reg[hidden_write_addr] <= hidden_write_data;
+      pending_valid <= group_read_req;
+      if (group_read_req) pending_group <= group_addr;
+    end
+  end
+endmodule
+
+module ping_pong_buffer (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        product_valid,
+    input  logic [15:0] product_in,
+    input  logic        product_last,
+    output logic        write_ready,
+    input  logic        consume_start,
+    input  logic        consume_ready,
+    output logic        consume_valid,
+    output logic [15:0] consume_data,
+    output logic        consume_last,
+    output logic        buffer_full,
+    output logic        buffer_empty
+);
+  typedef enum logic [1:0] {EMPTY, WRITING, FULL, READING} half_state_t;
+  half_state_t half_state[0:1];
+  logic [15:0] data_mem[0:1][0:6];
+  logic [2:0]  write_pos[0:1];
+  logic [2:0]  read_pos[0:1];
+  logic [2:0]  valid_count[0:1];
+  logic [7:0]  age[0:1];
+  logic [7:0]  age_counter;
+  logic        write_sel;
+  logic        read_sel;
+  logic        write_fire;
+  logic        consume_fire;
+  integer i;
+
+  always_comb begin
+    // Steps 2 and 6: only a WRITING half can accept a product.
+    write_ready = (half_state[write_sel] == WRITING) &&
+                  (write_pos[write_sel] < 3'd7);
+    buffer_full = (half_state[0] == FULL) || (half_state[1] == FULL);
+    buffer_empty = !((half_state[0] == FULL) ||
+                      (half_state[0] == READING) ||
+                      (half_state[1] == FULL) ||
+                      (half_state[1] == READING));
+    consume_valid = (half_state[read_sel] == READING) &&
+                    (read_pos[read_sel] < valid_count[read_sel]);
+    consume_data = 16'h0000;
+    if (consume_valid) consume_data = data_mem[read_sel][read_pos[read_sel]];
+    consume_last = consume_valid &&
+                   (read_pos[read_sel] + 3'd1 == valid_count[read_sel]);
+    write_fire = write_ready && (product_valid || product_last);
+    consume_fire = consume_valid && consume_ready;
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 1: reset both halves to EMPTY.
+      half_state[0] <= EMPTY; half_state[1] <= EMPTY;
+      write_pos[0] <= 3'd0; write_pos[1] <= 3'd0;
+      read_pos[0] <= 3'd0; read_pos[1] <= 3'd0;
+      valid_count[0] <= 3'd0; valid_count[1] <= 3'd0;
+      age[0] <= 8'd0; age[1] <= 8'd0;
+      age_counter <= 8'd0;
+      write_sel <= 1'b0;
+      read_sel <= 1'b0;
+      for (i = 0; i < 7; i = i + 1) begin
+        data_mem[0][i] <= 16'd0;
+        data_mem[1][i] <= 16'd0;
+      end
+    end else begin
+      // Step 2: write only accepted valid products.
+      if (write_fire) begin
+        if (product_valid) begin
+          data_mem[write_sel][write_pos[write_sel]] <= product_in;
+          valid_count[write_sel] <= valid_count[write_sel] + 3'd1;
+          write_pos[write_sel] <= write_pos[write_sel] + 3'd1;
+        end
+        // Step 3: product_last closes the current group, including a partial one.
+        if (product_last) begin
+          half_state[write_sel] <= FULL;
+          age[write_sel] <= age_counter;
+          age_counter <= age_counter + 3'd1;
+          if (half_state[1-write_sel] == EMPTY) begin
+            write_sel <= 1'b1 - write_sel;
+            write_pos[1-write_sel] <= 3'd0;
+            valid_count[1-write_sel] <= 3'd0;
+            half_state[1-write_sel] <= WRITING;
+          end
+        end
+      end
+
+      // Step 4: choose oldest FULL half when a consumer starts.
+      if (consume_start && buffer_full &&
+          (half_state[0] != READING) && (half_state[1] != READING)) begin
+        if ((half_state[0] == FULL) && (half_state[1] == FULL))
+          read_sel <= (age[0] <= age[1]) ? 1'b0 : 1'b1;
+        else if (half_state[0] == FULL)
+          read_sel <= 1'b0;
+        else
+          read_sel <= 1'b1;
+        if ((half_state[0] == FULL) && (half_state[1] == FULL)) begin
+          if (age[0] <= age[1]) half_state[0] <= READING;
+          else half_state[1] <= READING;
+        end else if (half_state[0] == FULL) begin
+          half_state[0] <= READING;
+        end else begin
+          half_state[1] <= READING;
+        end
+      end
+
+      // Step 5: remove data only on valid/ready and free a half after its last.
+      if (consume_fire) begin
+        if (consume_last) begin
+          half_state[read_sel] <= EMPTY;
+          read_pos[read_sel] <= 3'd0;
+          write_pos[read_sel] <= 3'd0;
+          valid_count[read_sel] <= 3'd0;
+          // Reuse begins after this edge, never on the same edge.
+          if ((half_state[write_sel] != WRITING) &&
+              (write_sel == read_sel || half_state[write_sel] == FULL))
+            write_sel <= read_sel;
+        end else begin
+          read_pos[read_sel] <= read_pos[read_sel] + 3'd1;
+        end
+      end
+    end
+  end
+endmodule
+
+module argmax (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        start,
+    input  logic        logit_valid,
+    input  logic [15:0] logit_in,
+    input  logic [3:0]  logit_index,
+    input  logic        logit_last,
+    output logic        busy,
+    output logic [3:0]  prediction,
+    output logic        done,
+    output logic [15:0] logit0_out,
+    output logic [15:0] logit1_out,
+    output logic [15:0] logit2_out,
+    output logic [15:0] logit3_out,
+    output logic [15:0] logit4_out,
+    output logic [15:0] logit5_out,
+    output logic [15:0] logit6_out,
+    output logic [15:0] logit7_out,
+    output logic [15:0] logit8_out,
+    output logic [15:0] logit9_out
+);
+  import fp16_pkg::*;
+  typedef enum logic {IDLE, COLLECT} state_t;
+  state_t state;
+  logic [15:0] best_logit;
+  logic [3:0]  best_index;
+  logic        seen_valid;
+  logic [15:0] next_best_logit;
+  logic [3:0]  next_best_index;
+  logic        next_seen_valid;
+  logic        valid_index;
+  integer i;
+
+  always_comb begin
+    // Step 2: include the current valid sample in the candidate comparison.
+    valid_index = logit_index < 4'd10;
+    next_best_logit = best_logit;
+    next_best_index = best_index;
+    next_seen_valid = seen_valid;
+    if (logit_valid && valid_index) begin
+      if (!seen_valid || fp16_gt(logit_in, best_logit)) begin
+        next_best_logit = logit_in;
+        next_best_index = logit_index;
+      end
+      next_seen_valid = 1'b1;
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      // Step 5: reset collection and all visible logits.
+      state <= IDLE;
+      busy <= 1'b0;
+      done <= 1'b0;
+      prediction <= 4'd0;
+      best_logit <= 16'd0;
+      best_index <= 4'd0;
+      seen_valid <= 1'b0;
+      logit0_out <= 16'd0; logit1_out <= 16'd0;
+      logit2_out <= 16'd0; logit3_out <= 16'd0;
+      logit4_out <= 16'd0; logit5_out <= 16'd0;
+      logit6_out <= 16'd0; logit7_out <= 16'd0;
+      logit8_out <= 16'd0; logit9_out <= 16'd0;
+    end else begin
+      done <= 1'b0;
+      if (state == IDLE) begin
+        busy <= 1'b0;
+        if (start) begin
+          // Step 1: begin a new collection and clear previous logits.
+          state <= COLLECT;
+          busy <= 1'b1;
+          seen_valid <= 1'b0;
+          logit0_out <= 16'd0; logit1_out <= 16'd0;
+          logit2_out <= 16'd0; logit3_out <= 16'd0;
+          logit4_out <= 16'd0; logit5_out <= 16'd0;
+          logit6_out <= 16'd0; logit7_out <= 16'd0;
+          logit8_out <= 16'd0; logit9_out <= 16'd0;
+        end
+      end else begin
+        busy <= 1'b1;
+        if (logit_valid && valid_index) begin
+          // Step 2: indexed stable logit write.
+          case (logit_index)
+            4'd0: logit0_out <= logit_in;
+            4'd1: logit1_out <= logit_in;
+            4'd2: logit2_out <= logit_in;
+            4'd3: logit3_out <= logit_in;
+            4'd4: logit4_out <= logit_in;
+            4'd5: logit5_out <= logit_in;
+            4'd6: logit6_out <= logit_in;
+            4'd7: logit7_out <= logit_in;
+            4'd8: logit8_out <= logit_in;
+            4'd9: logit9_out <= logit_in;
+            default: ;
+          endcase
+          best_logit <= next_best_logit;
+          best_index <= next_best_index;
+          seen_valid <= next_seen_valid;
+          if (logit_last) begin
+            // Step 3: final sample is already included in next_best_index.
+            prediction <= next_best_index;
+            done <= 1'b1;
+            busy <= 1'b0;
+            state <= IDLE;
+          end
+        end
+      end
+    end
+  end
+endmodule
+
+module controller_fsm (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        start,
+    input  logic        input_group_valid,
+    input  logic        weight_row_valid,
+    input  logic [15:0] weight0_in,
+    input  logic [15:0] weight1_in,
+    input  logic [15:0] weight2_in,
+    input  logic [15:0] weight3_in,
+    input  logic [15:0] weight4_in,
+    input  logic [15:0] weight5_in,
+    input  logic [15:0] weight6_in,
+    input  logic [6:0]  weight_lane_valid,
+    input  logic        multiplier_busy,
+    input  logic        buffer_write_ready,
+    input  logic        buffer_consume_last,
+    input  logic        accumulator_result_valid,
+    input  logic        argmax_done,
+    output logic        input_read_req,
+    output logic [6:0]  input_group_addr,
+    output logic        weight_read_req,
+    output logic [9:0]  weight_row_addr,
+    output logic        bias_read_req,
+    output logic [4:0]  bias_addr,
+    output logic        multiplier_start,
+    output logic [15:0] selected_weight0,
+    output logic [15:0] selected_weight1,
+    output logic [15:0] selected_weight2,
+    output logic [15:0] selected_weight3,
+    output logic [15:0] selected_weight4,
+    output logic [15:0] selected_weight5,
+    output logic [15:0] selected_weight6,
+    output logic [6:0]  selected_weight_valid,
+    output logic        buffer_consume_start,
+    output logic        accumulator_start,
+    output logic        accumulator_neuron_last,
+    output logic        hidden_write_en,
+    output logic [2:0]  hidden_write_addr,
+    output logic        layer2_group_read_req,
+    output logic        layer2_group_addr,
+    output logic        argmax_start,
+    output logic        argmax_logit_valid,
+    output logic [3:0]  argmax_logit_index,
+    output logic        argmax_logit_last,
+    output logic        busy,
+    output logic        done
+);
+  typedef enum logic [4:0] {
+    IDLE, FC1_BIAS_REQ, FC1_BIAS_WAIT, FC1_INPUT_REQ,
+    FC1_OPERAND_WAIT, FC1_MAC_START, FC1_GROUP_WAIT,
+    FC1_RESULT_WAIT, FC1_RELU_STORE, FC2_BIAS_REQ,
+    FC2_BIAS_WAIT, FC2_GROUP_REQ, FC2_WEIGHT_GATHER,
+    FC2_OPERAND_WAIT, FC2_MAC_START, FC2_GROUP_WAIT,
+    FC2_RESULT_WAIT, FC2_LOGIT_SEND, COMPLETE_WAIT
+  } state_t;
+  state_t state, next_state;
+  logic [2:0] neuron_index;
+  logic [3:0] digit_index;
+  logic       group_index;
+  logic       input_seen, weight_seen;
+  logic       consume_started;
+  logic [1:0] fc2_part;
+  logic [1:0] fc2_needed_rows;
+  logic [9:0] pending_weight_row;
+  logic [15:0] sel_w[0:6];
+  logic [6:0] sel_mask;
+  integer i;
+
+  // Step 1: state, counters, and FC2 lane-gather staging registers.
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      state <= IDLE;
+      neuron_index <= 3'd0;
+      digit_index <= 4'd0;
+      group_index <= 1'b0;
+      input_seen <= 1'b0;
+      weight_seen <= 1'b0;
+      consume_started <= 1'b0;
+      fc2_part <= 2'd0;
+      fc2_needed_rows <= 2'd1;
+      pending_weight_row <= 10'd0;
+      sel_mask <= 7'd0;
+      for (i = 0; i < 7; i = i + 1) sel_w[i] <= 16'd0;
+    end else begin
+      state <= next_state;
+      if (state == IDLE && start) begin
+        neuron_index <= 3'd0;
+        digit_index <= 4'd0;
+        group_index <= 1'b0;
+        consume_started <= 1'b0;
+      end
+      if (state == FC1_INPUT_REQ) begin
+        input_seen <= 1'b0;
+        weight_seen <= 1'b0;
+        consume_started <= 1'b0;
+      end
+      if (state == FC1_OPERAND_WAIT) begin
+        if (input_group_valid) input_seen <= 1'b1;
+        if (weight_row_valid) begin
+          weight_seen <= 1'b1;
+          sel_w[0] <= weight0_in; sel_w[1] <= weight1_in;
+          sel_w[2] <= weight2_in; sel_w[3] <= weight3_in;
+          sel_w[4] <= weight4_in; sel_w[5] <= weight5_in;
+          sel_w[6] <= weight6_in;
+          sel_mask <= weight_lane_valid;
+        end
+      end
+      if (state == FC2_BIAS_WAIT && input_group_valid) begin
+        group_index <= 1'b0;
+        fc2_part <= 2'd0;
+      end
+      if (state == FC2_GROUP_REQ && fc2_part == 2'd0) begin
+        input_seen <= 1'b0;
+        weight_seen <= 1'b0;
+        fc2_needed_rows <=
+          (((8*digit_index + (group_index ? 7 : 0)) / 7) ==
+           ((8*digit_index + (group_index ? 7 : 0) + (group_index ? 0 : 6)) / 7))
+          ? 2'd1 : 2'd2;
+        sel_mask <= 7'd0;
+        for (i = 0; i < 7; i = i + 1) sel_w[i] <= 16'd0;
+      end
+      if (state == FC2_GROUP_REQ) begin
+        pending_weight_row <= 10'd896 +
+          ((8*digit_index + (group_index ? 7 : 0) + 7*fc2_part) / 7);
+      end
+      if (state == FC2_WEIGHT_GATHER) begin
+        if (input_group_valid) input_seen <= 1'b1;
+        if (weight_row_valid) begin
+          // Step 1/FC2 mapping: copy only lanes belonging to this logical group.
+          for (i = 0; i < 7; i = i + 1) begin
+            if (((8*digit_index + (group_index ? 7 : 0) + i) / 7) ==
+                (pending_weight_row - 10'd896)) begin
+              case ((8*digit_index + (group_index ? 7 : 0) + i) % 7)
+                0: begin sel_w[i] <= weight0_in; sel_mask[i] <= weight_lane_valid[0]; end
+                1: begin sel_w[i] <= weight1_in; sel_mask[i] <= weight_lane_valid[1]; end
+                2: begin sel_w[i] <= weight2_in; sel_mask[i] <= weight_lane_valid[2]; end
+                3: begin sel_w[i] <= weight3_in; sel_mask[i] <= weight_lane_valid[3]; end
+                4: begin sel_w[i] <= weight4_in; sel_mask[i] <= weight_lane_valid[4]; end
+                5: begin sel_w[i] <= weight5_in; sel_mask[i] <= weight_lane_valid[5]; end
+                default: begin sel_w[i] <= weight6_in; sel_mask[i] <= weight_lane_valid[6]; end
+              endcase
+            end
+          end
+          if (fc2_part + 2'd1 >= fc2_needed_rows) weight_seen <= 1'b1;
+          else fc2_part <= fc2_part + 2'd1;
+        end
+      end
+      if ((state == FC1_GROUP_WAIT || state == FC2_GROUP_WAIT) &&
+          !multiplier_busy && !consume_started)
+        consume_started <= 1'b1;
+      if ((state == FC1_GROUP_WAIT || state == FC2_GROUP_WAIT) &&
+          buffer_consume_last) begin
+        consume_started <= 1'b0;
+        if (state == FC1_GROUP_WAIT) begin
+          if (group_index == 1'b1) group_index <= 1'b0;
+          else group_index <= 1'b1;
+        end else begin
+          if (group_index == 1'b0) group_index <= 1'b1;
+          else group_index <= 1'b0;
+        end
+        if (state == FC2_GROUP_WAIT) fc2_part <= 2'd0;
+      end
+      if (state == FC1_RELU_STORE) begin
+        group_index <= 1'b0;
+        if (neuron_index != 3'd7) neuron_index <= neuron_index + 3'd1;
+        else begin
+          neuron_index <= 3'd0;
+          digit_index <= 4'd0;
+        end
+      end
+      if (state == FC2_LOGIT_SEND && digit_index != 4'd9)
+        digit_index <= digit_index + 4'd1;
+    end
+  end
+
+  // Step 2: defaults and state decoding for all requests and pulses.
+  always_comb begin
+    next_state = state;
+    input_read_req = 1'b0;
+    input_group_addr = group_index ? 7'd1 : group_index;
+    weight_read_req = 1'b0;
+    weight_row_addr = 10'd0;
+    bias_read_req = 1'b0;
+    bias_addr = 5'd0;
+    multiplier_start = 1'b0;
+    selected_weight0 = sel_w[0]; selected_weight1 = sel_w[1];
+    selected_weight2 = sel_w[2]; selected_weight3 = sel_w[3];
+    selected_weight4 = sel_w[4]; selected_weight5 = sel_w[5];
+    selected_weight6 = sel_w[6]; selected_weight_valid = sel_mask;
+    buffer_consume_start = 1'b0;
+    accumulator_start = 1'b0;
+    accumulator_neuron_last = 1'b0;
+    hidden_write_en = 1'b0;
+    hidden_write_addr = neuron_index;
+    layer2_group_read_req = 1'b0;
+    layer2_group_addr = group_index;
+    argmax_start = 1'b0;
+    argmax_logit_valid = 1'b0;
+    argmax_logit_index = digit_index;
+    argmax_logit_last = (digit_index == 4'd9);
+    busy = (state != IDLE);
+    done = 1'b0;
+
+    case (state)
+      IDLE: begin
+        if (start) begin
+          next_state = FC1_BIAS_REQ;
+          argmax_start = 1'b1;
+        end
+      end
+      FC1_BIAS_REQ: begin
+        bias_read_req = 1'b1;
+        bias_addr = {2'b00, neuron_index};
+        next_state = FC1_BIAS_WAIT;
+      end
+      FC1_BIAS_WAIT: begin
+        if (input_group_valid) begin
+          accumulator_start = 1'b1;
+          next_state = FC1_INPUT_REQ;
+        end
+      end
+      FC1_INPUT_REQ: begin
+        input_read_req = 1'b1;
+        input_group_addr = group_index;
+        weight_read_req = 1'b1;
+        weight_row_addr = neuron_index * 10'd112 + group_index;
+        next_state = FC1_OPERAND_WAIT;
+      end
+      FC1_OPERAND_WAIT: begin
+        if ((input_seen || input_group_valid) &&
+            (weight_seen || weight_row_valid)) next_state = FC1_MAC_START;
+      end
+      FC1_MAC_START: begin
+        if (buffer_write_ready) begin
+          multiplier_start = 1'b1;
+          next_state = FC1_GROUP_WAIT;
+        end
+      end
+      FC1_GROUP_WAIT: begin
+        accumulator_neuron_last = (group_index == 1'b1) && buffer_consume_last;
+        if (!multiplier_busy && !consume_started)
+          buffer_consume_start = 1'b1;
+        if (consume_started && buffer_consume_last) begin
+          if (group_index == 1'b1) next_state = FC1_RESULT_WAIT;
+          else begin
+            next_state = FC1_INPUT_REQ;
+            input_group_addr = group_index + 1'b1;
+            weight_row_addr = neuron_index * 10'd112 + group_index + 1'b1;
+          end
+        end
+      end
+      FC1_RESULT_WAIT: begin
+        if (accumulator_result_valid) next_state = FC1_RELU_STORE;
+      end
+      FC1_RELU_STORE: begin
+        hidden_write_en = 1'b1;
+        hidden_write_addr = neuron_index;
+        if (neuron_index == 3'd7) next_state = FC2_BIAS_REQ;
+        else next_state = FC1_BIAS_REQ;
+      end
+      FC2_BIAS_REQ: begin
+        bias_read_req = 1'b1;
+        bias_addr = 5'd8 + digit_index;
+        next_state = FC2_BIAS_WAIT;
+      end
+      FC2_BIAS_WAIT: begin
+        if (input_group_valid) begin
+          accumulator_start = 1'b1;
+          next_state = FC2_GROUP_REQ;
+        end
+      end
+      FC2_GROUP_REQ: begin
+        layer2_group_read_req = (fc2_part == 2'd0);
+        layer2_group_addr = group_index;
+        weight_read_req = 1'b1;
+        weight_row_addr = 10'd896 +
+          ((8*digit_index + (group_index ? 7 : 0) + 7*fc2_part) / 7);
+        next_state = FC2_WEIGHT_GATHER;
+      end
+      FC2_WEIGHT_GATHER: begin
+        if (weight_seen && input_seen) next_state = FC2_OPERAND_WAIT;
+        else if (weight_row_valid && !weight_seen &&
+                 (fc2_part + 2'd1 < fc2_needed_rows)) next_state = FC2_GROUP_REQ;
+      end
+      FC2_OPERAND_WAIT: begin
+        if (weight_seen && input_seen) next_state = FC2_MAC_START;
+      end
+      FC2_MAC_START: begin
+        if (buffer_write_ready) begin
+          multiplier_start = 1'b1;
+          next_state = FC2_GROUP_WAIT;
+        end
+      end
+      FC2_GROUP_WAIT: begin
+        accumulator_neuron_last = (group_index == 1'b1) && buffer_consume_last;
+        if (!multiplier_busy && !consume_started)
+          buffer_consume_start = 1'b1;
+        if (consume_started && buffer_consume_last) begin
+          if (group_index == 1'b1) next_state = FC2_RESULT_WAIT;
+          else next_state = FC2_GROUP_REQ;
+        end
+      end
+      FC2_RESULT_WAIT: begin
+        if (accumulator_result_valid) next_state = FC2_LOGIT_SEND;
+      end
+      FC2_LOGIT_SEND: begin
+        argmax_logit_valid = 1'b1;
+        argmax_logit_last = (digit_index == 4'd9);
+        if (digit_index == 4'd9) next_state = COMPLETE_WAIT;
+        else next_state = FC2_BIAS_REQ;
+      end
+      COMPLETE_WAIT: begin
+        if (argmax_done) begin
+          done = 1'b1;
+          next_state = IDLE;
+        end
+      end
+      default: next_state = IDLE;
+    endcase
+  end
+endmodule

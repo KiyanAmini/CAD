@@ -80,27 +80,12 @@ package fp16_pkg;
         end
         work = sig;
         if (discarded != 0) work[0] = 1'b1;
-        main_sig = work >> FP16_EXTRA;
-        guard_bit = (work >> (FP16_EXTRA-1)) & 1;
-        round_bit = (work >> (FP16_EXTRA-2)) & 1;
-        sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
-        if (guard_bit && (round_bit || sticky_bit || main_sig[0]))
-          main_sig = main_sig + 1;
-        if (main_sig >= 2048) begin
-          main_sig = main_sig >> 1;
-          expv = expv + 1;
-        end
-        if (expv > 15) begin
-          fp16_mul = {signv,5'h1f,10'h000};
-        end else if (expv >= -14) begin
-          fp16_mul = {signv,5'(expv+15),10'(main_sig-1024)};
-        end else begin
-          // Shift the normalized significand from its current exponent down
-          // to the binary16 subnormal boundary (-14).  The previous
-          // expression over-shifted by the significand precision and erased
-          // minimum-subnormal results.
+        if (expv < -14) begin
+          // Subnormal result: shift the UNROUNDED significand down to the
+          // binary16 -14 boundary and round exactly once (avoids double
+          // rounding and the exponent/significand skew of the old flow).
           shiftv = -14 - expv;
-          if (shiftv > 0) work = rshift_sticky(work, shiftv);
+          work = rshift_sticky(work, shiftv);
           main_sig = work >> FP16_EXTRA;
           guard_bit = (work >> (FP16_EXTRA-1)) & 1;
           round_bit = (work >> (FP16_EXTRA-2)) & 1;
@@ -111,6 +96,21 @@ package fp16_pkg;
             fp16_mul = {signv,5'h01,10'h000};
           else
             fp16_mul = {signv,5'h00,main_sig[9:0]};
+        end else begin
+          main_sig = work >> FP16_EXTRA;
+          guard_bit = (work >> (FP16_EXTRA-1)) & 1;
+          round_bit = (work >> (FP16_EXTRA-2)) & 1;
+          sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
+          if (guard_bit && (round_bit || sticky_bit || main_sig[0]))
+            main_sig = main_sig + 1;
+          if (main_sig >= 2048) begin
+            main_sig = main_sig >> 1;
+            expv = expv + 1;
+          end
+          if (expv > 15)
+            fp16_mul = {signv,5'h1f,10'h000};
+          else
+            fp16_mul = {signv,5'(expv+15),10'(main_sig-1024)};
         end
       end
     end
@@ -134,7 +134,8 @@ package fp16_pkg;
       end else if (fp16_is_inf(b)) begin
         fp16_add = b;
       end else if ((a[14:0] == 0) && (b[14:0] == 0)) begin
-        fp16_add = 16'h0000;
+        // IEEE-754 round-to-nearest: (-0)+(-0) = -0, every other zero sum = +0.
+        fp16_add = {a[15] & b[15], 15'h0000};
       end else if (a[14:0] == 0) begin
         fp16_add = b;
       end else if (b[14:0] == 0) begin
@@ -199,16 +200,7 @@ package fp16_pkg;
               sigsum = sigsum << 1; expv = expv - 1;
             end
             work = sigsum;
-            main_sig = work >> FP16_EXTRA;
-            guard_bit = (work >> (FP16_EXTRA-1)) & 1;
-            round_bit = (work >> (FP16_EXTRA-2)) & 1;
-            sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
-            if (guard_bit && (round_bit || sticky_bit || main_sig[0]))
-              main_sig = main_sig + 1;
-            if (main_sig >= 2048) begin main_sig = main_sig >> 1; expv = expv+1; end
-            if (expv > 15) fp16_add = {signv,5'h1f,10'h000};
-            else if (expv >= -14) fp16_add = {signv,5'(expv+15),10'(main_sig-1024)};
-            else begin
+            if (expv < -14) begin
               shiftv = -14 - expv;
               work = rshift_sticky(work, shiftv);
               main_sig = work >> FP16_EXTRA;
@@ -218,27 +210,36 @@ package fp16_pkg;
               if (guard_bit && (round_bit || sticky_bit || main_sig[0])) main_sig = main_sig+1;
               if (main_sig >= 1024) fp16_add = {signv,5'h01,10'h000};
               else fp16_add = {signv,5'h00,main_sig[9:0]};
+            end else begin
+              main_sig = work >> FP16_EXTRA;
+              guard_bit = (work >> (FP16_EXTRA-1)) & 1;
+              round_bit = (work >> (FP16_EXTRA-2)) & 1;
+              sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
+              if (guard_bit && (round_bit || sticky_bit || main_sig[0])) main_sig = main_sig + 1;
+              if (main_sig >= 2048) begin main_sig = main_sig >> 1; expv = expv+1; end
+              if (expv > 15) fp16_add = {signv,5'h1f,10'h000};
+              else fp16_add = {signv,5'(expv+15),10'(main_sig-1024)};
             end
           end
         end
         if ((sa == sb) && (sigsum != 0)) begin
           work = sigsum;
-          main_sig = work >> FP16_EXTRA;
-          guard_bit = (work >> (FP16_EXTRA-1)) & 1;
-          round_bit = (work >> (FP16_EXTRA-2)) & 1;
-          sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
-          if (guard_bit && (round_bit || sticky_bit || main_sig[0])) main_sig = main_sig+1;
-          if (main_sig >= 2048) begin main_sig=main_sig>>1; expv=expv+1; end
-          if (expv > 15) fp16_add = {signv,5'h1f,10'h000};
-          else if (expv >= -14) fp16_add = {signv,5'(expv+15),10'(main_sig-1024)};
-          else begin
-            shiftv = -14 - expv; work=rshift_sticky(work,shiftv);
-            main_sig=work>>FP16_EXTRA;
-            guard_bit=(work>>(FP16_EXTRA-1))&1; round_bit=(work>>(FP16_EXTRA-2))&1;
-            sticky_bit=((work&((64'h1<<(FP16_EXTRA-2))-1))!=0);
-            if (guard_bit && (round_bit || sticky_bit || main_sig[0])) main_sig=main_sig+1;
-            if (main_sig >= 1024) fp16_add={signv,5'h01,10'h000};
-            else fp16_add={signv,5'h00,main_sig[9:0]};
+          if (expv < -14) begin
+            shiftv = -14 - expv; work = rshift_sticky(work, shiftv);
+            main_sig = work >> FP16_EXTRA;
+            guard_bit = (work >> (FP16_EXTRA-1)) & 1; round_bit = (work >> (FP16_EXTRA-2)) & 1;
+            sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
+            if (guard_bit && (round_bit || sticky_bit || main_sig[0])) main_sig = main_sig+1;
+            if (main_sig >= 1024) fp16_add = {signv,5'h01,10'h000};
+            else fp16_add = {signv,5'h00,main_sig[9:0]};
+          end else begin
+            main_sig = work >> FP16_EXTRA;
+            guard_bit = (work >> (FP16_EXTRA-1)) & 1; round_bit = (work >> (FP16_EXTRA-2)) & 1;
+            sticky_bit = ((work & ((64'h1 << (FP16_EXTRA-2))-1)) != 0);
+            if (guard_bit && (round_bit || sticky_bit || main_sig[0])) main_sig = main_sig+1;
+            if (main_sig >= 2048) begin main_sig = main_sig >> 1; expv = expv+1; end
+            if (expv > 15) fp16_add = {signv,5'h1f,10'h000};
+            else fp16_add = {signv,5'(expv+15),10'(main_sig-1024)};
           end
         end
       end

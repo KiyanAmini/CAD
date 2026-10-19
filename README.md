@@ -111,3 +111,22 @@ vvp /tmp/fc16_tb.out \
 ```
 
 The model weights and biases remain the same; only the input image changes.
+
+## Additional verification and deliverables
+
+- `tests/fc16_unit_tb.sv` + `tests/fp16_vectors.mem` - directed unit tests
+  (FP16 multiply/add vs. numpy vectors, SRAM 7-edge latency, ReLU, argmax ties,
+  reset while busy). Run:
+
+  ```bash
+  iverilog -g2012 -s fc16_unit_tb -o /tmp/fc16_unit.out \
+    06_2_programmer.v tests/fc16_unit_tb.sv
+  vvp /tmp/fc16_unit.out
+  ```
+
+- `tools/fp16_arith_check.py` - simulator-free check of the RTL FP16 arithmetic
+  against numpy (`python3 tools/fp16_arith_check.py`).
+- `06_4_evaluator.md` - Evaluator report (findings, corrections, open items).
+- `diagrams/` - datapath and controller FSM figures (also in `sub_modules.zip`).
+- `code.v_05` - Section 5 code extracted from `code.md`.
+- `tools/make_submission.sh <SID1> <SID2>` - builds `CAD_CA1_<SID1>_<SID2>.zip`.
